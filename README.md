@@ -1,3 +1,3 @@
 # Grave
 
-A page based storage engine with fire-and-forget writes and crash-safe durability semantics.
+A crash-safe page-based storage engine with fire-and-forget durability semantics.

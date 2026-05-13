@@ -2,7 +2,7 @@
 name = "frozen_grave"
 version = "0.0.1"
 edition = "2024"
-description = "A page based storage engine w/ fire-and-forget writes and crash-safe durability semantics"
+description = "A crash-safe page-based storage engine with fire-and-forget durability semantics."
 keywords = [
     "rta",
     "database",
