@@ -17,8 +17,19 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/frozen-lab/frozen_grave"
 exclude = ["shell.nix"]
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2.178"
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
+additional-targets = ["i686-apple-darwin"]
+
+[dependencies.frozen-core]
+version = "0.0.18"
+default-features = false
+features = [
+    "crc32",
+    "fmmap",
+    "ffile",
+]
 
 [dev-dependencies]
 tempfile = "3.20.0"
