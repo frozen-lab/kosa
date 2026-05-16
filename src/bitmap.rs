@@ -27,6 +27,7 @@ const INITIAL_SLOT_CAPACITY: usize = (SLOT_PER_PAGE as usize * 4) + 1;
 
 struct BitMap {
     mmap: FrozenMMap<SLOT, MODULE_ID>,
+    simd: SIMD,
 }
 
 impl BitMap {
@@ -39,25 +40,33 @@ impl BitMap {
             },
         )?;
 
-        Ok(Self { mmap })
+        Ok(Self {
+            mmap,
+            simd: SIMD::new(),
+        })
     }
 
-    fn lookup_2(&self) -> FrozenRes<Option<(usize, u32, u32)>> {
-        const MASK: u32 = 0b11;
-
-        let header = unsafe { Header(self.mmap.read(0, |hdr| *hdr)?) };
+    #[inline(always)]
+    unsafe fn lookup_2(&self) -> FrozenRes<Option<(usize, u32, u32)>> {
+        let header = Header(self.mmap.read(0, |hdr| *hdr)?);
 
         let total_pages = header.total_pages();
         let start_page = header.current_page();
         let start_slot = header.current_slot();
 
         for rel_page in 0..total_pages {
-            let page_idx = (start_page + rel_page) % total_pages;
             let slot_begin = if rel_page == 0 { start_slot } else { 0 };
+            let page_idx = (start_page + rel_page) % total_pages;
             let page_off = 1 + (page_idx * SLOT_PER_PAGE);
 
             for slot_off in slot_begin..SLOT_PER_PAGE {
-                let slot = unsafe { self.mmap.read((page_off + slot_off) as usize, |s| *s) }?;
+                let mmap_slot = (page_off + slot_off) as usize;
+                let slot = unsafe { self.mmap.read(mmap_slot, |s| *s) }?;
+
+                if self.simd.is_full(&slot) {
+                    continue;
+                }
+
                 for word_idx in 0..WORD_PER_SLOT {
                     let word = slot[word_idx];
                     if word == WORD::MAX {
@@ -65,19 +74,23 @@ impl BitMap {
                     }
 
                     let inv = !word;
-                    for bit_idx in 0..0x1F {
-                        if ((inv >> bit_idx) & MASK) == MASK {
-                            let abs = (page_idx as usize * BITS_PER_PAGE)
-                                + (slot_off as usize * BITS_PER_SLOT)
-                                + (word_idx * 32)
-                                + bit_idx;
+                    let candidate = inv & (inv >> 1);
 
-                            return Ok(Some((abs, page_idx, slot_off)));
-                        }
+                    if candidate == 0 {
+                        continue;
                     }
+
+                    let bit_idx = candidate.trailing_zeros() as usize;
+                    let abs = (page_idx as usize * BITS_PER_PAGE)
+                        + (slot_off as usize * BITS_PER_SLOT)
+                        + (word_idx * 0x20)
+                        + bit_idx;
+
+                    return Ok(Some((abs, page_idx, slot_off)));
                 }
             }
         }
+
         Ok(None)
     }
 }
@@ -109,5 +122,73 @@ impl Header {
     #[inline]
     fn current_page(&self) -> u32 {
         self.0[Self::CURRENT_PAGE_INDEX]
+    }
+}
+
+enum ISA {
+    SSE2,
+    AVX2,
+}
+
+struct SIMD(ISA);
+
+impl SIMD {
+    fn new() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                return Self(ISA::AVX2);
+            }
+
+            return Self(ISA::SSE2);
+        }
+
+        // impl for aarch64
+        unimplemented!()
+    }
+
+    unsafe fn is_full(&self, slot: &SLOT) -> bool {
+        match self.0 {
+            ISA::SSE2 => self._is_full_sse2(slot),
+            ISA::AVX2 => self._is_full_avx2(slot),
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    unsafe fn _is_full_sse2(&self, slot: &SLOT) -> bool {
+        use std::arch::x86_64::*;
+
+        let full = _mm_set1_epi32(-1);
+        let ptr = slot.as_ptr() as *const __m128i;
+
+        let lo = unsafe { _mm_loadu_si128(ptr) };
+        let hi = unsafe { _mm_loadu_si128(ptr.add(1)) };
+
+        let cmp_lo = _mm_cmpeq_epi32(lo, full);
+        let cmp_hi = _mm_cmpeq_epi32(hi, full);
+
+        let lo_full = _mm_movemask_epi8(cmp_lo) == 0xFFFF;
+        let hi_full = _mm_movemask_epi8(cmp_hi) == 0xFFFF;
+
+        if lo_full && hi_full {
+            return true;
+        }
+
+        false
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn _is_full_avx2(&self, slot: &SLOT) -> bool {
+        use std::arch::x86_64::*;
+
+        let full = _mm256_set1_epi32(-1);
+        let ymm = unsafe { _mm256_loadu_si256(slot.as_ptr() as *const __m256i) };
+
+        let cmp = _mm256_cmpeq_epi32(ymm, full);
+        if _mm256_movemask_epi8(cmp) == -1 {
+            return true;
+        }
+
+        false
     }
 }
