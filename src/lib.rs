@@ -1,5 +1,6 @@
 // #![deny(missing_docs)]
 // #![deny(unused_must_use)]
+#![allow(unused)]
 #![allow(unsafe_op_in_unsafe_fn)]
 #![doc = include_str!("../README.md")]
 

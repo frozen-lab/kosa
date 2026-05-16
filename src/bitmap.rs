@@ -1,7 +1,5 @@
-#![allow(unused)]
-
 use crate::MODULE_ID;
-use frozen_core::{error::FrozenRes, fmmap::FrozenMMap};
+use frozen_core::{error::FrozenRes, fmmap::FrozenMMap, hints};
 
 type WORD = u32;
 
@@ -26,8 +24,8 @@ const BITS_PER_SLOT: usize = 8 * WORD_PER_SLOT * std::mem::size_of::<u32>();
 const INITIAL_SLOT_CAPACITY: usize = (SLOT_PER_PAGE as usize * 4) + 1;
 
 struct BitMap {
-    mmap: FrozenMMap<SLOT, MODULE_ID>,
     simd: SIMD,
+    mmap: FrozenMMap<SLOT, MODULE_ID>,
 }
 
 impl BitMap {
@@ -47,16 +45,25 @@ impl BitMap {
     }
 
     #[inline(always)]
-    unsafe fn lookup_2(&self) -> FrozenRes<Option<(usize, u32, u32)>> {
-        let header = Header(self.mmap.read(0, |hdr| *hdr)?);
+    pub unsafe fn allocate(&self, required: usize) -> FrozenRes<Option<(usize, u64)>> {
+        let hdr_slot = self.mmap.read(Header::HEADER_SLOT_INDEX, |hdr| *hdr)?;
+        let header = Header::from_slot(&hdr_slot);
 
-        let total_pages = header.total_pages();
-        let start_page = header.current_page();
-        let start_slot = header.current_slot();
+        if hints::unlikely(header.free_bits == 0) {
+            return Ok(None);
+        }
 
-        for rel_page in 0..total_pages {
-            let slot_begin = if rel_page == 0 { start_slot } else { 0 };
-            let page_idx = (start_page + rel_page) % total_pages;
+        match required {
+            2 => self.allocate_2(header),
+            _ => unimplemented!(),
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn allocate_2(&self, header: &Header) -> FrozenRes<Option<(usize, u64)>> {
+        for rel_page in 0..header.total_pages {
+            let slot_begin = if rel_page == 0 { header.current_slot } else { 0 };
+            let page_idx = (header.current_page + rel_page) % header.total_pages;
             let page_off = 1 + (page_idx * SLOT_PER_PAGE);
 
             for slot_off in slot_begin..SLOT_PER_PAGE {
@@ -86,7 +93,24 @@ impl BitMap {
                         + (word_idx * 0x20)
                         + bit_idx;
 
-                    return Ok(Some((abs, page_idx, slot_off)));
+                    let mut tx = self.mmap.new_tx();
+
+                    tx.write(Header::HEADER_SLOT_INDEX, |slot| {
+                        let hdr = Header::from_slot_mut(&mut *slot);
+
+                        hdr.current_page = page_idx;
+                        hdr.current_slot = (slot_off + 1) % SLOT_PER_PAGE;
+                        hdr.free_bits -= 2;
+                    })?;
+                    unsafe {
+                        tx.write(mmap_slot as usize, |slot| {
+                            let slot = &mut *slot;
+                            slot[word_idx] |= 0b11 << bit_idx;
+                        })?;
+                    }
+
+                    let epoch = tx.commit()?;
+                    return Ok(Some((abs, epoch)));
                 }
             }
         }
@@ -96,32 +120,28 @@ impl BitMap {
 }
 
 #[repr(C)]
-struct Header(SLOT);
+#[derive(Clone, Copy)]
+struct Header {
+    total_pages: u32,
+    current_page: u32,
+    current_slot: u32,
+    free_bits: u32,
+    _reserved: [u32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<Header>() == std::mem::size_of::<SLOT>());
 
 impl Header {
-    const CURRENT_PAGE_INDEX: usize = 1;
-    const CURRENT_SLOT_INDEX: usize = 2;
-    const TOTAL_PAGES_INDEX: usize = 0;
-    const AVAILABLE_FREE_SLOTS_INDEX: usize = 3;
+    const HEADER_SLOT_INDEX: usize = 0;
 
-    #[inline]
-    fn total_pages(&self) -> u32 {
-        self.0[Self::TOTAL_PAGES_INDEX]
+    #[inline(always)]
+    fn from_slot(slot: &SLOT) -> &Self {
+        unsafe { &*(slot as *const SLOT as *const Self) }
     }
 
-    #[inline]
-    fn available_free_slots(&self) -> u32 {
-        self.0[Self::AVAILABLE_FREE_SLOTS_INDEX]
-    }
-
-    #[inline]
-    fn current_slot(&self) -> u32 {
-        self.0[Self::CURRENT_SLOT_INDEX]
-    }
-
-    #[inline]
-    fn current_page(&self) -> u32 {
-        self.0[Self::CURRENT_PAGE_INDEX]
+    #[inline(always)]
+    fn from_slot_mut(slot: &mut SLOT) -> &mut Self {
+        unsafe { &mut *(slot as *mut SLOT as *mut Self) }
     }
 }
 
