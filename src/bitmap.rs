@@ -1,5 +1,6 @@
 use crate::MODULE_ID;
 use frozen_core::{error::FrozenRes, fmmap::FrozenMMap, hints};
+use std::sync::atomic;
 
 type WORD = u32;
 
@@ -9,39 +10,60 @@ type WORD = u32;
 /// could easily fit into a single `avx2` register for best possible performance for lookup
 type SLOT = [WORD; WORD_PER_SLOT];
 
-/// Number of slots available per page.
-///
-/// Each page contains 16 * [`SLOT`], i.e. 512 bytes
-const SLOT_PER_PAGE: u32 = 0x10;
-
 const WORD_PER_SLOT: usize = 8;
-const BITS_PER_PAGE: usize = BITS_PER_SLOT * SLOT_PER_PAGE as usize;
 const BITS_PER_SLOT: usize = 8 * WORD_PER_SLOT * std::mem::size_of::<u32>();
 
-/// Number of pages available when a new index is initialized from scratch
-///
-/// NOTE: First slot is reserved for [`Header`]
-const INITIAL_SLOT_CAPACITY: usize = (SLOT_PER_PAGE as usize * 4) + 1;
-
 struct BitMap {
+    pool: Pool,
     simd: SIMD,
     mmap: FrozenMMap<SLOT, MODULE_ID>,
 }
 
 impl BitMap {
-    pub(crate) fn new<P: AsRef<std::path::Path>>(path: P, flush_duration: std::time::Duration) -> FrozenRes<Self> {
+    /// Create a new instance of [`BitMap`]
+    ///
+    /// NOTE: `initial_cap` must be power of 2
+    pub(crate) fn new<P: AsRef<std::path::Path>>(
+        path: P,
+        initial_cap: u32,
+        flush_duration: std::time::Duration,
+    ) -> FrozenRes<Option<Self>> {
         let mmap = FrozenMMap::<SLOT, MODULE_ID>::new(
             path,
             frozen_core::fmmap::FMCfg {
                 flush_duration,
-                initial_count: INITIAL_SLOT_CAPACITY,
+                initial_count: 1 + initial_cap as usize,
             },
         )?;
 
-        Ok(Self {
+        let hdr_slot = unsafe { mmap.read(Header::HEADER_SLOT_INDEX, |hdr| *hdr) }?;
+        let header = Header::from_slot(&hdr_slot);
+
+        // new init (init header)
+        if header.total_slots == 0 {
+            let _ = unsafe {
+                mmap.write_sync(Header::HEADER_SLOT_INDEX, |hdr| {
+                    let header = Header::from_slot_mut(&mut *hdr);
+
+                    header.total_slots = initial_cap as u64;
+                    header.available_bits = (initial_cap * 8) as u64;
+                    header.slot_pointer = 0;
+                })
+            }?;
+        } else {
+            // we need to grow
+            if header.available_bits == 0 {
+                return Ok(None);
+            }
+        }
+
+        let pool = Pool::new(initial_cap);
+
+        Ok(Some(Self {
+            pool,
             mmap,
             simd: SIMD::new(),
-        })
+        }))
     }
 
     #[inline(always)]
@@ -49,7 +71,8 @@ impl BitMap {
         let hdr_slot = self.mmap.read(Header::HEADER_SLOT_INDEX, |hdr| *hdr)?;
         let header = Header::from_slot(&hdr_slot);
 
-        if hints::unlikely(header.free_bits == 0) {
+        // fast fail
+        if hints::unlikely(header.available_bits == 0) {
             return Ok(None);
         }
 
@@ -61,57 +84,60 @@ impl BitMap {
 
     #[inline(always)]
     unsafe fn allocate_2(&self, header: &Header) -> FrozenRes<Option<(usize, u64)>> {
-        for rel_page in 0..header.total_pages {
-            let slot_begin = if rel_page == 0 { header.current_slot } else { 0 };
-            let page_idx = (header.current_page + rel_page) % header.total_pages;
-            let page_off = 1 + (page_idx * SLOT_PER_PAGE);
+        let total = header.total_slots as usize;
+        for _ in 0..total {
+            let slot_idx = match self.pool.next() {
+                Some(idx) => idx,
+                None => return Ok(None),
+            };
 
-            for slot_off in slot_begin..SLOT_PER_PAGE {
-                let mmap_slot = (page_off + slot_off) as usize;
-                let slot = unsafe { self.mmap.read(mmap_slot, |s| *s) }?;
+            // NOTE: we must +1 as 0th slot is reserved for the header
+            let mmap_slot = slot_idx + 1;
 
-                if self.simd.is_full(&slot) {
+            let slot = unsafe { self.mmap.read(mmap_slot, |s| *s) }?;
+            let slot_base = slot_idx * BITS_PER_SLOT;
+
+            if unsafe { self.simd.is_full(&slot) } {
+                self.pool.retire(slot_idx);
+                continue;
+            }
+
+            for word_idx in 0..WORD_PER_SLOT {
+                let word = slot[word_idx];
+                if word == WORD::MAX {
                     continue;
                 }
 
-                for word_idx in 0..WORD_PER_SLOT {
-                    let word = slot[word_idx];
-                    if word == WORD::MAX {
-                        continue;
-                    }
+                let inv = !word;
+                let candidate = (inv & (inv >> 1)) & 0x5555_5555;
+                if candidate == 0 {
+                    continue;
+                }
 
-                    let inv = !word;
-                    let candidate = inv & (inv >> 1);
+                let bit_idx = candidate.trailing_zeros() as usize;
+                let abs = slot_base + (word_idx << 5) + bit_idx;
+                let mask = 0b11 << bit_idx;
 
-                    if candidate == 0 {
-                        continue;
-                    }
-
-                    let bit_idx = candidate.trailing_zeros() as usize;
-                    let abs = (page_idx as usize * BITS_PER_PAGE)
-                        + (slot_off as usize * BITS_PER_SLOT)
-                        + (word_idx * 0x20)
-                        + bit_idx;
-
-                    let mut tx = self.mmap.new_tx();
-
+                let mut tx = self.mmap.new_tx();
+                unsafe {
                     tx.write(Header::HEADER_SLOT_INDEX, |slot| {
                         let hdr = Header::from_slot_mut(&mut *slot);
 
-                        hdr.current_page = page_idx;
-                        hdr.current_slot = (slot_off + 1) % SLOT_PER_PAGE;
-                        hdr.free_bits -= 2;
+                        hdr.available_bits -= 2;
+                        hdr.slot_pointer = slot_idx as u64;
                     })?;
-                    unsafe {
-                        tx.write(mmap_slot as usize, |slot| {
-                            let slot = &mut *slot;
-                            slot[word_idx] |= 0b11 << bit_idx;
-                        })?;
-                    }
+                    tx.write(mmap_slot, |slot| {
+                        let slot = &mut *slot;
 
-                    let epoch = tx.commit()?;
-                    return Ok(Some((abs, epoch)));
+                        // validation under lock
+                        if (slot[word_idx] & mask) == 0 {
+                            slot[word_idx] |= mask;
+                        }
+                    })?;
                 }
+                let epoch = tx.commit()?;
+
+                return Ok(Some((abs, epoch)));
             }
         }
 
@@ -122,11 +148,10 @@ impl BitMap {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Header {
-    total_pages: u32,
-    current_page: u32,
-    current_slot: u32,
-    free_bits: u32,
-    _reserved: [u32; 4],
+    total_slots: u64,
+    slot_pointer: u64,
+    available_bits: u64,
+    _reserved_space: u64,
 }
 
 const _: () = assert!(std::mem::size_of::<Header>() == std::mem::size_of::<SLOT>());
@@ -232,5 +257,67 @@ impl SIMD {
         let hi_full = unsafe { vminvq_u32(cmp_hi) } == WORD::MAX;
 
         lo_full && hi_full
+    }
+}
+
+struct Pool {
+    total: u32,
+    cursor: atomic::AtomicU32,
+    slots: Box<[atomic::AtomicU32]>,
+}
+
+impl Pool {
+    const FREE: u32 = 0;
+    const CLAIMED: u32 = 1;
+    const FULL: u32 = 2;
+
+    /// NOTE: `total` must be power of 2
+    fn new(total: u32) -> Self {
+        let mut slots = Vec::with_capacity(total as usize);
+
+        for _ in 0..total {
+            slots.push(atomic::AtomicU32::new(Self::FREE));
+        }
+
+        Self {
+            total,
+            slots: slots.into_boxed_slice(),
+            cursor: atomic::AtomicU32::new(0),
+        }
+    }
+
+    #[inline(always)]
+    fn next(&self) -> Option<usize> {
+        let mask = self.total - 1;
+
+        for _ in 0..self.total {
+            let idx = (self.cursor.fetch_add(1, atomic::Ordering::Relaxed) & mask) as usize;
+
+            let slot = &self.slots[idx];
+
+            if slot
+                .compare_exchange_weak(
+                    Self::FREE,
+                    Self::CLAIMED,
+                    atomic::Ordering::Acquire,
+                    atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return Some(idx);
+            }
+        }
+
+        None
+    }
+
+    #[inline(always)]
+    fn release(&self, idx: usize) {
+        self.slots[idx].store(Self::FREE, atomic::Ordering::Release);
+    }
+
+    #[inline(always)]
+    fn retire(&self, idx: usize) {
+        self.slots[idx].store(Self::FULL, atomic::Ordering::Release);
     }
 }
