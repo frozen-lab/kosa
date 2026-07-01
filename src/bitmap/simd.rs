@@ -80,6 +80,12 @@ impl SIMD {
     }
 }
 
+#[allow(unused)]
+#[inline]
+pub(in crate::bitmap) fn is_slot_full_linear(slot: &Slot) -> bool {
+    slot.iter().all(|&x| x == FULL_WORD)
+}
+
 #[derive(Debug)]
 enum ISA {
     #[cfg(target_arch = "x86_64")]
@@ -90,4 +96,116 @@ enum ISA {
 
     #[cfg(target_arch = "aarch64")]
     NEON,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn validate_impl<F>(func: F)
+    where
+        F: Fn(&Slot) -> bool,
+    {
+        let cases = [
+            (([FULL_WORD, FULL_WORD, FULL_WORD, FULL_WORD]), true),
+            (([0, FULL_WORD, FULL_WORD, FULL_WORD]), false),
+            (([FULL_WORD, 0, FULL_WORD, FULL_WORD]), false),
+            (([FULL_WORD, FULL_WORD, 0, FULL_WORD]), false),
+            (([FULL_WORD, FULL_WORD, FULL_WORD, 0]), false),
+            (([0, 0, 0, 0]), false),
+            (([1, 2, 3, 4]), false),
+            (([FULL_WORD, FULL_WORD - 1, FULL_WORD, FULL_WORD]), false),
+        ];
+
+        for (slot, expected) in cases {
+            assert_eq!(func(&slot), expected);
+            assert_eq!(func(&slot), is_slot_full_linear(&slot));
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ok_sse2_isa() {
+        if !std::is_x86_feature_detected!("sse2") {
+            return;
+        }
+
+        unsafe {
+            validate_impl(|slot| SIMD::is_slot_full_sse2(slot));
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ok_avx2_isa() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        unsafe {
+            validate_impl(|slot| SIMD::is_slot_full_avx2(slot));
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ok_neon_isa() {
+        unsafe {
+            validate_impl(|slot| SIMD::is_slot_full_neon(slot));
+        }
+    }
+
+    #[test]
+    fn ok_runtime_dispatch_correctness() {
+        let simd = SIMD::new();
+        let cases = [
+            [FULL_WORD, FULL_WORD, FULL_WORD, FULL_WORD],
+            [0, FULL_WORD, FULL_WORD, FULL_WORD],
+            [FULL_WORD, 0, FULL_WORD, FULL_WORD],
+            [FULL_WORD, FULL_WORD, 0, FULL_WORD],
+            [FULL_WORD, FULL_WORD, FULL_WORD, 0],
+            [0, 0, 0, 0],
+            [1, 2, 3, 4],
+        ];
+
+        unsafe {
+            for slot in cases {
+                assert_eq!(simd.is_slot_full(&slot), is_slot_full_linear(&slot));
+            }
+        }
+    }
+
+    #[test]
+    fn ok_is_full_works_with_many_patterns() {
+        let simd = SIMD::new();
+        let patterns = [
+            0,
+            1,
+            0xFF,
+            0xFFFF,
+            0xFFFFFFFF,
+            0xAAAAAAAAAAAAAAAA,
+            0x5555555555555555,
+            FULL_WORD - 1,
+            FULL_WORD,
+        ];
+
+        unsafe {
+            for &a in &patterns {
+                for &b in &patterns {
+                    for &c in &patterns {
+                        for &d in &patterns {
+                            let slot = [a, b, c, d];
+                            assert_eq!(
+                                is_slot_full_linear(&slot),
+                                simd.is_slot_full(&slot),
+                                "failed for slot: {:?}",
+                                slot
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
