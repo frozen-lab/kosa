@@ -2,6 +2,7 @@
 name = "kosa"
 version = "0.0.1"
 edition = "2024"
+rust-version = "1.86.0"
 description = "Kośa is a reliable page-based storage engine w/ fire-and-forget durability semantics"
 keywords = [
     "database",
