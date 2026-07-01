@@ -4,6 +4,8 @@
 #![deny(unused_must_use)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
+mod bitmap;
+
 /// Module ID used in [`frozen_core::error::FrozenError`]
 pub(crate) const MODULE_ID: u8 = 0x01;
 
