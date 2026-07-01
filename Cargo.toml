@@ -1,10 +1,9 @@
 [package]
-name = "frozen_grave"
+name = "kosa"
 version = "0.0.1"
 edition = "2024"
-description = "A crash-safe page-based storage engine with fire-and-forget durability semantics."
+description = "Kośa is a reliable page-based storage engine w/ fire-and-forget durability semantics"
 keywords = [
-    "rta",
     "database",
     "persistence",
     "storage",
@@ -15,7 +14,13 @@ categories = [
 ]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/frozen-lab/frozen_grave"
-exclude = ["shell.nix"]
+exclude = [
+    ".github/",
+    "shell.nix",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+]
 
 [package.metadata.docs.rs]
 default-target = "x86_64-unknown-linux-gnu"
@@ -23,7 +28,7 @@ targets = ["aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
 additional-targets = ["i686-apple-darwin"]
 
 [dependencies.frozen-core]
-version = "0.0.18"
+version = "0.0.30"
 default-features = false
 features = [
     "crc32",
@@ -31,8 +36,11 @@ features = [
     "ffile",
 ]
 
-[dev-dependencies]
-tempfile = "3.20.0"
+[dev-dependencies.tempfile]
+version = "3.20.0"
+
+[dev-dependencies.hdrhistogram]
+version = "7.5.4"
 
 [profile.release]
 codegen-units = 1
