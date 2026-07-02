@@ -45,7 +45,8 @@ impl BitMap {
     #[inline(always)]
     pub(crate) fn allocate(&self, n: usize) -> error::FrozenResult<Option<usize>> {
         // sanity check
-        debug_assert!(n <= SLOTS_PER_ROW);
+        debug_assert_ne!(n, 0, "`n` must be greater then 0");
+        debug_assert!(n <= SLOTS_PER_ROW, "`n` must be lower then {}", SLOTS_PER_ROW);
 
         let mut slot: Option<usize> = None;
         let index = self.reservoir.acquire();
@@ -61,7 +62,7 @@ impl BitMap {
                 for row_idx in 0..USABLE_ROWS_PER_PAGE {
                     let row = &mut page.rows[row_idx];
 
-                    if self.simd.is_row_full(row) {
+                    if hints::unlikely(self.simd.is_row_full(row)) {
                         continue;
                     }
 
@@ -105,15 +106,20 @@ impl BitMap {
 
 #[inline(always)]
 fn lookup_run(word: Word, n: usize) -> Option<u32> {
+    debug_assert!((1..=0x40).contains(&n), "allocation size must be between 1 and 64 bits");
+
     let free = !word;
-    for start in 0..=(0x40 - n) {
-        let mask = if n == 0x40 { Word::MAX } else { ((1u64 << n) - 1) << start };
-        if free & mask == mask {
-            return Some(start as u32);
-        }
+    let mut candidates = free;
+
+    for shift in 1..n {
+        candidates &= free >> shift;
     }
 
-    None
+    if hints::unlikely(candidates == 0) {
+        return None;
+    }
+
+    Some(candidates.trailing_zeros())
 }
 
 #[repr(C)]
