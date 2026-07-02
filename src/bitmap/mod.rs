@@ -46,7 +46,7 @@ impl BitMap {
     pub(crate) fn allocate(&self, n: usize) -> error::FrozenResult<Option<usize>> {
         // sanity check
         debug_assert_ne!(n, 0, "`n` must be greater then 0");
-        debug_assert!(n <= SLOTS_PER_ROW, "`n` must be lower then {}", SLOTS_PER_ROW);
+        debug_assert!(n <= SLOTS_PER_WORD, "`n` must be lower then {}", SLOTS_PER_WORD);
 
         let mut slot: Option<usize> = None;
         let index = self.reservoir.acquire();
@@ -101,6 +101,43 @@ impl BitMap {
         }
 
         Ok(None)
+    }
+
+    #[inline(always)]
+    pub(crate) fn free(&self, index: usize, n: usize) -> error::FrozenResult<()> {
+        let page_idx = index / SLOTS_PER_PAGE;
+
+        // sanity checks
+        debug_assert!(page_idx < self.mmap.total_slots());
+        debug_assert_ne!(n, 0, "`n` must be greater than 0");
+        debug_assert!(n <= SLOTS_PER_WORD, "`n` must be <= {}", SLOTS_PER_WORD);
+
+        let slot = index % SLOTS_PER_PAGE;
+        let row_idx = slot / SLOTS_PER_ROW;
+        let slot = slot % SLOTS_PER_ROW;
+        let word_idx = slot / SLOTS_PER_WORD;
+        let bit_idx = slot % SLOTS_PER_WORD;
+
+        unsafe {
+            self.mmap.write(page_idx, |raw_page| {
+                let page = &mut *raw_page;
+
+                let row = &mut page.rows[row_idx];
+                let was_row_full = self.simd.is_row_full(row);
+
+                let word = &mut row[word_idx];
+                let mask = if n == 64 { u64::MAX } else { ((1u64 << n) - 1) << bit_idx };
+
+                *word &= !mask;
+                if was_row_full {
+                    page.meta.full_rows_counter -= 1;
+                }
+
+                page.meta.current_word_ptr = word_idx as u64;
+            })
+        }?;
+
+        Ok(())
     }
 }
 
