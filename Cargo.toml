@@ -35,6 +35,8 @@ features = [
     "crc32",
     "fmmap",
     "ffile",
+    "hints",
+    "reservoir",
 ]
 
 [dev-dependencies.tempfile]

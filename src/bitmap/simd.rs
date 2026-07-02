@@ -1,4 +1,4 @@
-use crate::bitmap::{FULL_WORD, Slot};
+use crate::bitmap::{FULL_WORD, Row};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -27,22 +27,22 @@ impl SIMD {
     }
 
     #[inline(always)]
-    pub(in crate::bitmap) unsafe fn is_slot_full(&self, slot: &Slot) -> bool {
+    pub(in crate::bitmap) unsafe fn is_row_full(&self, slot: &Row) -> bool {
         match self.isa {
             #[cfg(target_arch = "x86_64")]
-            ISA::SSE2 => unsafe { Self::is_slot_full_sse2(slot) },
+            ISA::SSE2 => unsafe { Self::is_row_full_sse2(slot) },
 
             #[cfg(target_arch = "x86_64")]
-            ISA::AVX2 => unsafe { Self::is_slot_full_avx2(slot) },
+            ISA::AVX2 => unsafe { Self::is_row_full_avx2(slot) },
 
             #[cfg(target_arch = "aarch64")]
-            ISA::NEON => unsafe { Self::is_slot_full_neon(slot) },
+            ISA::NEON => unsafe { Self::is_row_full_neon(slot) },
         }
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "sse2")]
-    unsafe fn is_slot_full_sse2(slot: &Slot) -> bool {
+    unsafe fn is_row_full_sse2(slot: &Row) -> bool {
         let full = _mm_set1_epi64x(FULL_WORD as i64);
         let ptr = slot.as_ptr() as *const __m128i;
 
@@ -60,7 +60,7 @@ impl SIMD {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    unsafe fn is_slot_full_avx2(slot: &Slot) -> bool {
+    unsafe fn is_row_full_avx2(slot: &Row) -> bool {
         let full = _mm256_set1_epi64x(FULL_WORD as i64);
         let ymm = _mm256_loadu_si256(slot.as_ptr() as *const __m256i);
         let cmp = _mm256_cmpeq_epi64(ymm, full);
@@ -70,7 +70,7 @@ impl SIMD {
 
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
-    unsafe fn is_slot_full_neon(slot: &Slot) -> bool {
+    unsafe fn is_row_full_neon(slot: &Row) -> bool {
         let ptr = slot.as_ptr();
         let lo = vld1q_u64(ptr);
         let hi = vld1q_u64(ptr.add(2));
@@ -82,7 +82,7 @@ impl SIMD {
 
 #[allow(unused)]
 #[inline]
-pub(in crate::bitmap) fn is_slot_full_linear(slot: &Slot) -> bool {
+pub(in crate::bitmap) fn is_slot_full_linear(slot: &Row) -> bool {
     slot.iter().all(|&x| x == FULL_WORD)
 }
 
@@ -104,7 +104,7 @@ mod tests {
 
     fn validate_impl<F>(func: F)
     where
-        F: Fn(&Slot) -> bool,
+        F: Fn(&Row) -> bool,
     {
         let cases = [
             (([FULL_WORD, FULL_WORD, FULL_WORD, FULL_WORD]), true),
@@ -131,7 +131,7 @@ mod tests {
         }
 
         unsafe {
-            validate_impl(|slot| SIMD::is_slot_full_sse2(slot));
+            validate_impl(|slot| SIMD::is_row_full_sse2(slot));
         }
     }
 
@@ -143,7 +143,7 @@ mod tests {
         }
 
         unsafe {
-            validate_impl(|slot| SIMD::is_slot_full_avx2(slot));
+            validate_impl(|slot| SIMD::is_row_full_avx2(slot));
         }
     }
 
@@ -170,7 +170,7 @@ mod tests {
 
         unsafe {
             for slot in cases {
-                assert_eq!(simd.is_slot_full(&slot), is_slot_full_linear(&slot));
+                assert_eq!(simd.is_row_full(&slot), is_slot_full_linear(&slot));
             }
         }
     }
@@ -198,7 +198,7 @@ mod tests {
                             let slot = [a, b, c, d];
                             assert_eq!(
                                 is_slot_full_linear(&slot),
-                                simd.is_slot_full(&slot),
+                                simd.is_row_full(&slot),
                                 "failed for slot: {:?}",
                                 slot
                             );
