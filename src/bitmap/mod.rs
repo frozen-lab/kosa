@@ -225,6 +225,18 @@ const _: () = assert!(mem::size_of::<Page>() == mem::size_of::<Row>() * TOTALE_R
 mod tests {
     use super::*;
 
+    const INIT_PAGES: usize = 0x0A;
+    const FLUSH_DURATION: time::Duration = time::Duration::from_secs(1);
+
+    #[inline]
+    fn init() -> (tempfile::TempDir, BitMap) {
+        let dir = tempfile::tempdir().expect("new_dir");
+        let path = dir.path().join("bmap");
+        let map = BitMap::new(path, INIT_PAGES, FLUSH_DURATION).expect("new bmap");
+
+        (dir, map)
+    }
+
     #[cfg(test)]
     mod find_free_run {
         use super::*;
@@ -292,6 +304,190 @@ mod tests {
         #[test]
         fn ok_entire_row() {
             assert_eq!(find_free_run(&[0; WORDS_PER_ROW], 0, 0x100), Some(0));
+        }
+    }
+
+    mod allocate {
+        use super::*;
+        use std::{collections::HashSet, sync::Arc};
+
+        #[test]
+        fn ok_single_bit_until_full() {
+            let (_dir, bitmap) = init();
+            let mut seen = HashSet::new();
+
+            for _ in 0..SLOTS_PER_PAGE {
+                let bit = bitmap.allocate(1).unwrap().unwrap();
+                assert!(seen.insert(bit));
+            }
+
+            assert_eq!(bitmap.allocate(1).unwrap(), None);
+        }
+
+        #[test]
+        fn ok_entire_page() {
+            let (_dir, bitmap) = init();
+
+            for _ in 0..USABLE_ROWS_PER_PAGE {
+                assert!(bitmap.allocate(SLOTS_PER_ROW).unwrap().is_some());
+            }
+
+            assert_eq!(bitmap.allocate(1).unwrap(), None);
+        }
+
+        #[test]
+        fn ok_cross_word() {
+            let (_dir, bitmap) = init();
+
+            let bit = bitmap.allocate(0x60).unwrap().unwrap();
+            assert_eq!(bit, 0);
+
+            bitmap.free(bit, 0x60).unwrap();
+            let bit2 = bitmap.allocate(0x60).unwrap().unwrap();
+
+            assert_eq!(bit2, 0x40);
+        }
+
+        #[test]
+        fn ok_reuse_after_free() {
+            let (_dir, bitmap) = init();
+
+            let first = bitmap.allocate(0x60).unwrap().unwrap();
+            bitmap.free(first, 0x60).unwrap();
+
+            let second = bitmap.allocate(0x60).unwrap().unwrap();
+            bitmap.free(second, 0x60).unwrap();
+
+            assert_ne!(first, usize::MAX);
+            assert_ne!(second, usize::MAX);
+        }
+
+        #[test]
+        fn ok_fill_all_rows() {
+            let (_dir, bitmap) = init();
+
+            for _ in 0..USABLE_ROWS_PER_PAGE {
+                assert!(bitmap.allocate(SLOTS_PER_ROW).unwrap().is_some());
+            }
+
+            assert_eq!(bitmap.allocate(1).unwrap(), None);
+        }
+
+        #[test]
+        fn ok_multiple_sizes() {
+            let (_dir, bitmap) = init();
+
+            for size in 1..=SLOTS_PER_ROW {
+                let bit = bitmap.allocate(size).unwrap().unwrap();
+                bitmap.free(bit, size).unwrap();
+            }
+        }
+
+        #[test]
+        fn ok_unique_indices() {
+            let (_dir, bitmap) = init();
+
+            let mut seen = HashSet::new();
+            while let Some(bit) = bitmap.allocate(1).unwrap() {
+                assert!(seen.insert(bit), "duplicate allocation: {bit}");
+            }
+
+            assert_eq!(seen.len(), SLOTS_PER_PAGE);
+        }
+
+        #[test]
+        fn ok_random_allocate_free() {
+            let (_dir, bitmap) = init();
+
+            let mut allocs = Vec::new();
+            for i in 0..0x2000 {
+                let size = (i % SLOTS_PER_ROW) + 1;
+                if let Some(bit) = bitmap.allocate(size).unwrap() {
+                    allocs.push((bit, size));
+                }
+
+                if allocs.len() > 0x20 {
+                    let (bit, size) = allocs.remove(0);
+                    bitmap.free(bit, size).unwrap();
+                }
+            }
+
+            while let Some((bit, size)) = allocs.pop() {
+                bitmap.free(bit, size).unwrap();
+            }
+
+            assert!(bitmap.allocate(SLOTS_PER_ROW).unwrap().is_some());
+        }
+
+        #[test]
+        fn ok_parallel_contention() {
+            let (_dir, bitmap) = init();
+            let bitmap = Arc::new(bitmap);
+
+            std::thread::scope(|scope| {
+                for tid in 0..0x10 {
+                    let bitmap = Arc::clone(&bitmap);
+
+                    scope.spawn(move || {
+                        let mut owned = Vec::new();
+
+                        for i in 0..0x61A8 {
+                            let size = ((i + tid) % SLOTS_PER_ROW) + 1;
+                            if let Some(bit) = bitmap.allocate(size).unwrap() {
+                                owned.push((bit, size));
+                            }
+
+                            if owned.len() >= 0x40 {
+                                let idx = owned.len() / 2;
+                                let (bit, size) = owned.swap_remove(idx);
+                                bitmap.free(bit, size).unwrap();
+                            }
+                        }
+
+                        while let Some((bit, size)) = owned.pop() {
+                            bitmap.free(bit, size).unwrap();
+                        }
+                    });
+                }
+            });
+
+            assert!(bitmap.allocate(SLOTS_PER_ROW).unwrap().is_some());
+        }
+
+        #[test]
+        fn ok_fill_and_empty_page() {
+            let (_dir, bitmap) = init();
+
+            let mut allocs = Vec::new();
+            while let Some(bit) = bitmap.allocate(1).unwrap() {
+                allocs.push(bit);
+            }
+
+            assert_eq!(allocs.len(), SLOTS_PER_PAGE);
+
+            for bit in allocs {
+                bitmap.free(bit, 1).unwrap();
+            }
+
+            assert!(bitmap.allocate(SLOTS_PER_PAGE / USABLE_ROWS_PER_PAGE).unwrap().is_some());
+        }
+
+        #[test]
+        fn ok_fragmentation() {
+            let (_dir, bitmap) = init();
+
+            let mut allocs = Vec::new();
+            for _ in 0..0x40 {
+                allocs.push(bitmap.allocate(4).unwrap().unwrap());
+            }
+
+            for bit in allocs.iter().step_by(2) {
+                bitmap.free(*bit, 4).unwrap();
+            }
+
+            for _ in 0..0x20 {
+                assert!(bitmap.allocate(4).unwrap().is_some());
+            }
         }
     }
 }
