@@ -1,7 +1,7 @@
 mod simd;
 
-use frozen_core::{error, fmmap, hints, reservoir};
-use std::{mem, path, time};
+use frozen_core::{error, fmmap, hints};
+use std::{mem, path, sync::atomic, time};
 
 pub(in crate::bitmap) type Word = u64;
 pub(in crate::bitmap) type Row = [Word; 4];
@@ -20,7 +20,7 @@ pub(in crate::bitmap) const SLOTS_PER_PAGE: usize = SLOTS_PER_ROW * (TOTALE_ROWS
 pub(crate) struct BitMap {
     simd: simd::SIMD,
     mmap: fmmap::FrozenMMap<Page>,
-    reservoir: reservoir::Reservoir<usize>,
+    next_page: atomic::AtomicUsize,
 }
 
 impl BitMap {
@@ -36,10 +36,31 @@ impl BitMap {
             module_id: crate::MODULE_ID,
         };
         let mmap = fmmap::FrozenMMap::<Page>::new(path, cfg)?;
-        let total_pages = mmap.total_slots();
-        let reservoir = reservoir::Reservoir::new((0..total_pages).into_iter().collect());
+        let init_page = Self::find_init_page_idx(&mmap);
 
-        Ok(Self { mmap, reservoir, simd: simd::SIMD::new() })
+        Ok(Self { mmap, simd: simd::SIMD::new(), next_page: atomic::AtomicUsize::new(init_page) })
+    }
+
+    fn find_init_page_idx(mmap: &fmmap::FrozenMMap<Page>) -> usize {
+        let mut latest = 0;
+        let total = mmap.total_slots();
+
+        for i in 0..total {
+            if let Some(idx) = unsafe {
+                mmap.read(i, |page| {
+                    if (*page).meta.full_rows_counter < TOTALE_ROWS_PER_PAGE as u64 {
+                        return Some(i);
+                    }
+
+                    None
+                })
+            } {
+                latest = i;
+                break;
+            }
+        }
+
+        latest
     }
 
     #[inline(always)]
@@ -48,11 +69,12 @@ impl BitMap {
         debug_assert_ne!(n, 0, "`n` must be greater than 0");
         debug_assert!(n <= SLOTS_PER_ROW, "`n` must be <= {}", SLOTS_PER_ROW);
 
-        let mut slot = None;
-        let page_idx = self.reservoir.acquire();
+        let total_pages = self.mmap.total_slots();
+        let start = self.next_page.fetch_add(1, atomic::Ordering::Relaxed) % total_pages;
 
+        let mut slot = None;
         unsafe {
-            self.mmap.write(*page_idx, |raw_page| {
+            self.mmap.write(start, |raw_page| {
                 let page = &mut *raw_page;
                 if hints::unlikely(page.meta.full_rows_counter == USABLE_ROWS_PER_PAGE as u64) {
                     return;
@@ -82,7 +104,7 @@ impl BitMap {
             })
         }?;
 
-        Ok(slot.map(|local| (*page_idx * SLOTS_PER_PAGE) + local))
+        Ok(slot.map(|local| (start * SLOTS_PER_PAGE) + local))
     }
 
     #[inline(always)]
@@ -600,6 +622,55 @@ mod tests {
             while bitmap.allocate(1).unwrap().is_some() {}
 
             assert_eq!(bitmap.allocate(1).unwrap(), None);
+        }
+    }
+
+    mod stress {
+        use super::*;
+
+        const OPS: usize = 0x20_000;
+
+        #[test]
+        fn stress_random_operations() {
+            let (_dir, bitmap) = init();
+
+            let mut rng: u64 = 0xDEADC0DECAFEBABE;
+            let mut allocs = Vec::<(usize, usize)>::new();
+
+            #[inline(always)]
+            fn rand(state: &mut u64) -> u64 {
+                *state ^= *state << 0x0D;
+                *state ^= *state >> 7;
+                *state ^= *state << 0x11;
+                *state
+            }
+
+            for _ in 0..OPS {
+                if allocs.is_empty() || (rand(&mut rng) % 0x64) < 0x3C {
+                    let size = (rand(&mut rng) as usize % SLOTS_PER_ROW) + 1;
+
+                    if let Some(bit) = bitmap.allocate(size).unwrap() {
+                        allocs.push((bit, size));
+                    }
+                } else {
+                    let idx = rand(&mut rng) as usize % allocs.len();
+                    let (bit, size) = allocs.swap_remove(idx);
+
+                    bitmap.free(bit, size).unwrap();
+                }
+            }
+
+            while let Some((bit, size)) = allocs.pop() {
+                bitmap.free(bit, size).unwrap();
+            }
+
+            // NOTE: Should be completely reusable
+            let mut count = 0;
+            while bitmap.allocate(1).unwrap().is_some() {
+                count += 1;
+            }
+
+            assert_eq!(count, INIT_PAGES * SLOTS_PER_PAGE);
         }
     }
 }
