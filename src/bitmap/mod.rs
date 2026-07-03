@@ -220,3 +220,78 @@ pub(in crate::bitmap) struct Page {
 
 const _: () = assert!(mem::size_of::<PageMeta>() == mem::size_of::<Row>());
 const _: () = assert!(mem::size_of::<Page>() == mem::size_of::<Row>() * TOTALE_ROWS_PER_PAGE);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(test)]
+    mod find_free_run {
+        use super::*;
+
+        #[test]
+        fn ok_empty_row() {
+            let row = [0; WORDS_PER_ROW];
+
+            assert_eq!(find_free_run(&row, 0, 1), Some(0));
+            assert_eq!(find_free_run(&row, 0, 0x40), Some(0));
+            assert_eq!(find_free_run(&row, 0, SLOTS_PER_ROW), Some(0));
+        }
+
+        #[test]
+        fn ok_full_row() {
+            let row = [FULL_WORD; WORDS_PER_ROW];
+
+            assert_eq!(find_free_run(&row, 0, 1), None);
+            assert_eq!(find_free_run(&row, 0, 0x40), None);
+            assert_eq!(find_free_run(&row, 0, SLOTS_PER_ROW), None);
+        }
+
+        #[test]
+        fn ok_exactly_fills_row() {
+            let row = [0; WORDS_PER_ROW];
+            assert_eq!(find_free_run(&row, 0, SLOTS_PER_ROW), Some(0));
+        }
+
+        #[test]
+        fn ok_starts_at_last_word() {
+            let mut row = [FULL_WORD; WORDS_PER_ROW];
+            row[3] = 0;
+
+            assert_eq!(find_free_run(&row, 3, 0x20), Some(0xC0));
+        }
+
+        #[test]
+        fn ok_honors_start_word() {
+            let mut row = [FULL_WORD; WORDS_PER_ROW];
+
+            row[0] = 0;
+            row[2] = 0;
+
+            assert_eq!(find_free_run(&row, 2, 8), Some(0x80));
+        }
+
+        #[test]
+        fn ok_wraps_to_beginning() {
+            let mut row = [FULL_WORD; WORDS_PER_ROW];
+
+            row[0] = 0;
+            row[3] = FULL_WORD;
+
+            assert_eq!(find_free_run(&row, 3, 8), Some(0));
+        }
+
+        #[test]
+        fn ok_single_bit() {
+            let mut row = [FULL_WORD; WORDS_PER_ROW];
+            row[1] = !(1 << 0x11);
+
+            assert_eq!(find_free_run(&row, 0, 1), Some(0x51));
+        }
+
+        #[test]
+        fn ok_entire_row() {
+            assert_eq!(find_free_run(&[0; WORDS_PER_ROW], 0, 0x100), Some(0));
+        }
+    }
+}
