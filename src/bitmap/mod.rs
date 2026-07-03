@@ -490,4 +490,116 @@ mod tests {
             }
         }
     }
+
+    mod free {
+        use super::*;
+
+        #[test]
+        fn ok_single_allocation() {
+            let (_dir, bitmap) = init();
+
+            let bit = bitmap.allocate(1).unwrap().unwrap();
+            bitmap.free(bit, 1).unwrap();
+
+            assert!(bitmap.allocate(SLOTS_PER_ROW).unwrap().is_some());
+        }
+
+        #[test]
+        fn ok_first_allocation() {
+            let (_dir, bitmap) = init();
+
+            let first = bitmap.allocate(8).unwrap().unwrap();
+            let second = bitmap.allocate(8).unwrap().unwrap();
+
+            bitmap.free(first, 8).unwrap();
+            bitmap.free(second, 8).unwrap();
+
+            assert!(bitmap.allocate(SLOTS_PER_ROW).unwrap().is_some());
+        }
+
+        #[test]
+        fn ok_last_allocation() {
+            let (_dir, bitmap) = init();
+
+            let mut last = None;
+            while let Some(bit) = bitmap.allocate(1).unwrap() {
+                last = Some(bit);
+            }
+
+            let last = last.expect("expected at least one allocation");
+            bitmap.free(last, 1).unwrap();
+
+            assert!(bitmap.allocate(1).unwrap().is_some());
+        }
+
+        #[test]
+        fn ok_cross_word_allocation() {
+            let (_dir, bitmap) = init();
+
+            let bit = bitmap.allocate(0x60).unwrap().unwrap();
+            bitmap.free(bit, 0x60).unwrap();
+
+            assert!(bitmap.allocate(0x60).unwrap().is_some());
+        }
+
+        #[test]
+        fn ok_entire_row() {
+            let (_dir, bitmap) = init();
+
+            let mut allocs = Vec::new();
+            for _ in 0..USABLE_ROWS_PER_PAGE {
+                allocs.push(bitmap.allocate(SLOTS_PER_ROW).unwrap().unwrap());
+            }
+
+            for bit in allocs {
+                bitmap.free(bit, SLOTS_PER_ROW).unwrap();
+            }
+
+            for _ in 0..USABLE_ROWS_PER_PAGE {
+                assert!(bitmap.allocate(SLOTS_PER_ROW).unwrap().is_some());
+            }
+        }
+
+        #[test]
+        fn ok_allocate_after_free() {
+            let (_dir, bitmap) = init();
+
+            let bit = bitmap.allocate(0x25).unwrap().unwrap();
+            bitmap.free(bit, 0x25).unwrap();
+
+            let bit2 = bitmap.allocate(0x25).unwrap().unwrap();
+            bitmap.free(bit2, 0x25).unwrap();
+
+            assert!(bitmap.allocate(SLOTS_PER_ROW).unwrap().is_some());
+        }
+
+        #[test]
+        fn ok_free_random_order() {
+            let (_dir, bitmap) = init();
+
+            let mut allocs = Vec::new();
+            let mut size = 1;
+
+            while let Some(bit) = bitmap.allocate(size).unwrap() {
+                allocs.push((bit, size));
+                size += 1;
+
+                if size > SLOTS_PER_ROW {
+                    size = 1;
+                }
+            }
+
+            assert!(!allocs.is_empty());
+
+            while !allocs.is_empty() {
+                let idx = allocs.len() / 2;
+                let (bit, size) = allocs.swap_remove(idx);
+                bitmap.free(bit, size).unwrap();
+            }
+
+            while bitmap.allocate(1).unwrap().is_some() {}
+
+            assert_eq!(bitmap.allocate(1).unwrap(), None);
+        }
+    }
 }
