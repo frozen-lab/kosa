@@ -3,18 +3,19 @@ mod simd;
 use frozen_core::{error, fmmap, hints};
 use std::{mem, path, sync::atomic, time};
 
-pub(in crate::bitmap) type Word = u64;
 pub(in crate::bitmap) type Row = [Word; 4];
-
 pub(in crate::bitmap) const FULL_WORD: Word = Word::MAX;
-pub(in crate::bitmap) const TOTALE_ROWS_PER_PAGE: usize = 8;
-pub(in crate::bitmap) const USABLE_ROWS_PER_PAGE: usize = TOTALE_ROWS_PER_PAGE - 1;
 
-pub(in crate::bitmap) const SLOTS_PER_ROW: usize = mem::size_of::<Row>() * mem::size_of::<u64>();
-pub(in crate::bitmap) const SLOTS_PER_WORD: usize = mem::size_of::<Word>() * mem::size_of::<u64>();
+type Word = u64;
 
-pub(in crate::bitmap) const WORDS_PER_ROW: usize = mem::size_of::<Row>() / 8;
-pub(in crate::bitmap) const SLOTS_PER_PAGE: usize = SLOTS_PER_ROW * (TOTALE_ROWS_PER_PAGE - 1);
+const TOTALE_ROWS_PER_PAGE: usize = 8;
+const USABLE_ROWS_PER_PAGE: usize = TOTALE_ROWS_PER_PAGE - 1;
+
+const SLOTS_PER_ROW: usize = mem::size_of::<Row>() * mem::size_of::<u64>();
+const SLOTS_PER_WORD: usize = mem::size_of::<Word>() * mem::size_of::<u64>();
+
+const WORDS_PER_ROW: usize = mem::size_of::<Row>() / 8;
+const SLOTS_PER_PAGE: usize = SLOTS_PER_ROW * (TOTALE_ROWS_PER_PAGE - 1);
 
 #[derive(Debug)]
 pub(crate) struct BitMap {
@@ -48,7 +49,7 @@ impl BitMap {
         for i in 0..total {
             if let Some(idx) = unsafe {
                 mmap.read(i, |page| {
-                    if (*page).meta.full_rows_counter < TOTALE_ROWS_PER_PAGE as u64 {
+                    if (*page).meta.full_rows_counter < USABLE_ROWS_PER_PAGE as u64 {
                         return Some(i);
                     }
 
@@ -70,41 +71,50 @@ impl BitMap {
         debug_assert!(n <= SLOTS_PER_ROW, "`n` must be <= {}", SLOTS_PER_ROW);
 
         let total_pages = self.mmap.total_slots();
-        let start = self.next_page.fetch_add(1, atomic::Ordering::Relaxed) % total_pages;
+        let start_page = self.next_page.load(atomic::Ordering::Relaxed);
 
-        let mut slot = None;
-        unsafe {
-            self.mmap.write(start, |raw_page| {
-                let page = &mut *raw_page;
-                if hints::unlikely(page.meta.full_rows_counter == USABLE_ROWS_PER_PAGE as u64) {
-                    return;
-                }
+        for i in 0..total_pages {
+            let page_idx = (start_page + i) % total_pages;
+            let mut slot = None;
 
-                let start_word = page.meta.current_word_ptr as usize;
-                for row_idx in 0..USABLE_ROWS_PER_PAGE {
-                    let row = &mut page.rows[row_idx];
-                    if hints::unlikely(self.simd.is_row_full(row)) {
-                        continue;
-                    }
-
-                    if let Some(bit) = find_free_run(row, start_word, n) {
-                        set_run(row, bit, n);
-
-                        if self.simd.is_row_full(row) {
-                            page.meta.full_rows_counter += 1;
-                        }
-
-                        page.meta.current_word_ptr =
-                            (((bit / SLOTS_PER_WORD) + 1) & (WORDS_PER_ROW - 1)) as u64;
-
-                        slot = Some(row_idx * SLOTS_PER_ROW + bit);
+            unsafe {
+                self.mmap.write(page_idx, |raw_page| {
+                    let page = &mut *raw_page;
+                    if hints::unlikely(page.meta.full_rows_counter == USABLE_ROWS_PER_PAGE as u64) {
                         return;
                     }
-                }
-            })
-        }?;
 
-        Ok(slot.map(|local| (start * SLOTS_PER_PAGE) + local))
+                    let start_word = page.meta.current_word_ptr as usize;
+                    for row_idx in 0..USABLE_ROWS_PER_PAGE {
+                        let row = &mut page.rows[row_idx];
+                        if hints::unlikely(self.simd.is_row_full(row)) {
+                            continue;
+                        }
+
+                        if let Some(bit) = find_free_run(row, start_word, n) {
+                            set_run(row, bit, n);
+
+                            if self.simd.is_row_full(row) {
+                                page.meta.full_rows_counter += 1;
+                            }
+
+                            page.meta.current_word_ptr =
+                                (((bit / SLOTS_PER_WORD) + 1) & (WORDS_PER_ROW - 1)) as u64;
+
+                            slot = Some(row_idx * SLOTS_PER_ROW + bit);
+                            return;
+                        }
+                    }
+                })
+            }?;
+
+            if let Some(local_slot) = slot {
+                self.next_page.store(page_idx, atomic::Ordering::Relaxed);
+                return Ok(Some((page_idx * SLOTS_PER_PAGE) + local_slot));
+            }
+        }
+
+        Ok(None)
     }
 
     #[inline(always)]
@@ -260,7 +270,7 @@ mod tests {
     }
 
     #[cfg(test)]
-    mod find_free_run {
+    mod t_find_free_run {
         use super::*;
 
         #[test]
@@ -329,33 +339,9 @@ mod tests {
         }
     }
 
-    mod allocate {
+    mod t_allocate {
         use super::*;
         use std::{collections::HashSet, sync::Arc};
-
-        #[test]
-        fn ok_single_bit_until_full() {
-            let (_dir, bitmap) = init();
-            let mut seen = HashSet::new();
-
-            for _ in 0..SLOTS_PER_PAGE {
-                let bit = bitmap.allocate(1).unwrap().unwrap();
-                assert!(seen.insert(bit));
-            }
-
-            assert_eq!(bitmap.allocate(1).unwrap(), None);
-        }
-
-        #[test]
-        fn ok_entire_page() {
-            let (_dir, bitmap) = init();
-
-            for _ in 0..USABLE_ROWS_PER_PAGE {
-                assert!(bitmap.allocate(SLOTS_PER_ROW).unwrap().is_some());
-            }
-
-            assert_eq!(bitmap.allocate(1).unwrap(), None);
-        }
 
         #[test]
         fn ok_cross_word() {
@@ -385,17 +371,6 @@ mod tests {
         }
 
         #[test]
-        fn ok_fill_all_rows() {
-            let (_dir, bitmap) = init();
-
-            for _ in 0..USABLE_ROWS_PER_PAGE {
-                assert!(bitmap.allocate(SLOTS_PER_ROW).unwrap().is_some());
-            }
-
-            assert_eq!(bitmap.allocate(1).unwrap(), None);
-        }
-
-        #[test]
         fn ok_multiple_sizes() {
             let (_dir, bitmap) = init();
 
@@ -403,18 +378,6 @@ mod tests {
                 let bit = bitmap.allocate(size).unwrap().unwrap();
                 bitmap.free(bit, size).unwrap();
             }
-        }
-
-        #[test]
-        fn ok_unique_indices() {
-            let (_dir, bitmap) = init();
-
-            let mut seen = HashSet::new();
-            while let Some(bit) = bitmap.allocate(1).unwrap() {
-                assert!(seen.insert(bit), "duplicate allocation: {bit}");
-            }
-
-            assert_eq!(seen.len(), SLOTS_PER_PAGE);
         }
 
         #[test]
@@ -477,24 +440,6 @@ mod tests {
         }
 
         #[test]
-        fn ok_fill_and_empty_page() {
-            let (_dir, bitmap) = init();
-
-            let mut allocs = Vec::new();
-            while let Some(bit) = bitmap.allocate(1).unwrap() {
-                allocs.push(bit);
-            }
-
-            assert_eq!(allocs.len(), SLOTS_PER_PAGE);
-
-            for bit in allocs {
-                bitmap.free(bit, 1).unwrap();
-            }
-
-            assert!(bitmap.allocate(SLOTS_PER_PAGE / USABLE_ROWS_PER_PAGE).unwrap().is_some());
-        }
-
-        #[test]
         fn ok_fragmentation() {
             let (_dir, bitmap) = init();
 
@@ -511,9 +456,79 @@ mod tests {
                 assert!(bitmap.allocate(4).unwrap().is_some());
             }
         }
+
+        #[test]
+        fn ok_single_bit_until_full() {
+            let (_dir, bitmap) = init();
+            let mut seen = HashSet::new();
+            let total_capacity = SLOTS_PER_PAGE * INIT_PAGES;
+
+            for _ in 0..total_capacity {
+                let bit = bitmap.allocate(1).unwrap().unwrap();
+                assert!(seen.insert(bit));
+            }
+
+            assert_eq!(bitmap.allocate(1).unwrap(), None);
+        }
+
+        #[test]
+        fn ok_entire_page() {
+            let (_dir, bitmap) = init();
+            let total_rows = USABLE_ROWS_PER_PAGE * INIT_PAGES;
+
+            for _ in 0..total_rows {
+                assert!(bitmap.allocate(SLOTS_PER_ROW).unwrap().is_some());
+            }
+
+            assert_eq!(bitmap.allocate(1).unwrap(), None);
+        }
+
+        #[test]
+        fn ok_fill_all_rows() {
+            let (_dir, bitmap) = init();
+            let total_rows = USABLE_ROWS_PER_PAGE * INIT_PAGES;
+
+            for _ in 0..total_rows {
+                assert!(bitmap.allocate(SLOTS_PER_ROW).unwrap().is_some());
+            }
+
+            assert_eq!(bitmap.allocate(1).unwrap(), None);
+        }
+
+        #[test]
+        fn ok_unique_indices() {
+            let (_dir, bitmap) = init();
+            let mut seen = HashSet::new();
+
+            while let Some(bit) = bitmap.allocate(1).unwrap() {
+                assert!(seen.insert(bit), "duplicate allocation: {bit}");
+            }
+
+            assert_eq!(seen.len(), SLOTS_PER_PAGE * INIT_PAGES);
+        }
+
+        #[test]
+        fn ok_fill_and_empty_page() {
+            let (_dir, bitmap) = init();
+            let mut allocs = Vec::new();
+
+            // Fill all pages
+            while let Some(bit) = bitmap.allocate(1).unwrap() {
+                allocs.push(bit);
+            }
+
+            assert_eq!(allocs.len(), SLOTS_PER_PAGE * INIT_PAGES);
+
+            // Free exactly one page worth of slots to test capacity recovery
+            for bit in allocs.into_iter().take(SLOTS_PER_PAGE) {
+                bitmap.free(bit, 1).unwrap();
+            }
+
+            assert!(bitmap.allocate(SLOTS_PER_PAGE / USABLE_ROWS_PER_PAGE).unwrap().is_some());
+        }
     }
 
-    mod free {
+    mod t_free {
         use super::*;
 
         #[test]
