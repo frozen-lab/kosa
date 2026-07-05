@@ -40,17 +40,19 @@ pub struct KosaCfg {
 pub struct Kosa {
     file: sync::Arc<ffile::FrozenFile>,
     pipe: wpipe::WritePipe,
-    bmap: bitmap::BitMap,
+    bmap: sync::RwLock<bitmap::BitMap>,
     crc32c: crc32::Crc32C,
     pool: bufpool::BufPool,
     buf_size: usize,
+    bmap_path: path::PathBuf,
+    flush_duration: time::Duration,
 }
 
 impl Kosa {
     ///
     pub fn new(cfg: KosaCfg) -> error::FrozenResult<Self> {
-        let data_path = cfg.path.with_extension("data");
-        let bmap_path = cfg.path.with_extension("bmap");
+        let data_path = cfg.path.join("data");
+        let bmap_path = cfg.path.join("bmap");
 
         let file_cfg = ffile::FrozenFileCfg {
             path: data_path,
@@ -73,15 +75,17 @@ impl Kosa {
         } else {
             (cfg.initial_available_buffers + bitmap::SLOTS_PER_PAGE - 1) / bitmap::SLOTS_PER_PAGE
         };
-        let bmap = bitmap::BitMap::new(bmap_path, init_pages, cfg.flush_duration)?;
+        let bmap = bitmap::BitMap::new(bmap_path.clone(), init_pages, cfg.flush_duration)?;
 
         Ok(Self {
             file,
             pipe,
-            bmap,
             pool,
+            bmap_path,
+            bmap: sync::RwLock::new(bmap),
             crc32c: crc32::Crc32C::new(),
             buf_size: cfg.buffer_size as usize,
+            flush_duration: cfg.flush_duration,
         })
     }
 
@@ -113,7 +117,27 @@ impl Kosa {
             dst[..CRC_SIZE].copy_from_slice(&checksum);
         }
 
-        let slot_index = self.bmap.allocate(required)?.unwrap();
+        let mut slot_index_opt = self.read_bmap()?.allocate(required)?;
+        if slot_index_opt.is_none() {
+            let mut bmap_write = self.write_bmap()?;
+            slot_index_opt = bmap_write.allocate(required)?;
+
+            if slot_index_opt.is_none() {
+                let current_pages = bmap_write.total_pages();
+                let added_pages = current_pages;
+
+                *bmap_write = bitmap::BitMap::new_grown(
+                    &self.bmap_path,
+                    current_pages,
+                    self.flush_duration,
+                    added_pages,
+                )?;
+
+                slot_index_opt = bmap_write.allocate(required)?;
+            }
+        }
+
+        let slot_index = slot_index_opt.unwrap();
         let req = wpipe::WriteRequest { allocation, slot_index };
 
         Ok((req, slot_index as u64))
@@ -158,23 +182,47 @@ impl Kosa {
     ///
     #[inline(always)]
     pub fn delete(&self, slot_index: u64, n: usize) -> error::FrozenResult<()> {
-        self.bmap.free(slot_index as usize, n)
+        self.read_bmap()?.free(slot_index as usize, n)
+    }
+
+    #[inline]
+    fn read_bmap(&self) -> error::FrozenResult<sync::RwLockReadGuard<'_, bitmap::BitMap>> {
+        self.bmap.read().map_err(|poison_err| err::new_error(err::PSN, poison_err))
+    }
+
+    #[inline]
+    fn write_bmap(&self) -> error::FrozenResult<sync::RwLockWriteGuard<'_, bitmap::BitMap>> {
+        self.bmap.write().map_err(|poison_err| err::new_error(err::PSN, poison_err))
     }
 }
 
+mod err {
+    use super::error::{ErrCode, FrozenError};
+
+    /// Domain ID for [`wpipe`] module is `0x02` used while propagating errors
+    const DOMAIN_ID: u8 = 0x14;
+
+    #[inline]
+    pub fn new_error<E: std::fmt::Display>(code: ErrCode, observed_error: E) -> FrozenError {
+        FrozenError::new_raw(super::MODULE_ID, DOMAIN_ID, code, observed_error)
+    }
+
+    pub const PSN: ErrCode = ErrCode::new(0x02, "lock poisoned");
+}
+
 #[cfg(test)]
-mod tests {
+mod lib_tests {
     use super::*;
     use tempfile::tempdir;
 
-    const TEST_FLUSH_DUR: time::Duration = time::Duration::from_millis(100);
-    const TEST_MAX_MEM: usize = 1024 * 1024 * 10; // 10MB
+    const TEST_FLUSH_DUR: time::Duration = time::Duration::from_millis(0x64);
+    const TEST_MAX_MEM: usize = 0x400 * 0x400 * 0x0A;
 
     fn setup_engine(path: &path::Path) -> Kosa {
         let cfg = KosaCfg {
             path: path.to_path_buf(),
             buffer_size: BufferSize::S4096,
-            initial_available_buffers: 64,
+            initial_available_buffers: 0x40,
             flush_duration: TEST_FLUSH_DUR,
             max_memory: TEST_MAX_MEM,
         };
@@ -183,11 +231,11 @@ mod tests {
 
     #[test]
     fn ok_write_single_block() {
-        let dir = tempdir().expect("Failed to create temp dir");
-        let engine = setup_engine(dir.path().join("single_block.db").as_path());
+        let dir = tempdir().unwrap();
+        let engine = setup_engine(dir.path());
 
         let payload = b"hello world, fire and forget. Go";
-        let (req, slot_index) = engine.write(payload).expect("Write failed");
+        let (req, slot_index) = engine.write(payload).unwrap();
 
         assert_eq!(req.allocation.length(), 1);
         assert_eq!(slot_index, 0);
@@ -204,8 +252,8 @@ mod tests {
 
     #[test]
     fn ok_delete_lifecycle() {
-        let dir = tempdir().expect("Failed to create temp dir");
-        let engine = setup_engine(dir.path().join("delete.db").as_path());
+        let dir = tempdir().unwrap();
+        let engine = setup_engine(dir.path());
 
         let payload = vec![0x01; 0x100];
         let (_req1, slot1) = engine.write(&payload).expect("First write failed");
@@ -216,8 +264,8 @@ mod tests {
 
     #[test]
     fn ok_read_empty_required() {
-        let dir = tempdir().expect("Failed to create temp dir");
-        let engine = setup_engine(dir.path().join("read_empty.db").as_path());
+        let dir = tempdir().unwrap();
+        let engine = setup_engine(dir.path());
 
         let result = engine.read(0, 0).expect("Read failed");
         assert_eq!(result, Some(Vec::new()), "Expected empty vector for 0 required blocks");

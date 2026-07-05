@@ -84,6 +84,11 @@ impl BitMap {
     }
 
     #[inline(always)]
+    pub(crate) fn total_pages(&self) -> usize {
+        self.mmap.total_slots()
+    }
+
+    #[inline(always)]
     pub(crate) fn allocate(&self, n: usize) -> error::FrozenResult<Option<usize>> {
         // sanity checks
         debug_assert_ne!(n, 0, "`n` must be greater than 0");
