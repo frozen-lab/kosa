@@ -5,7 +5,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(unused)]
 
-use frozen_core::{bufpool, crc32, error, ffile, utils, wpipe};
+use frozen_core::{ack, bufpool, crc32, error, ffile, utils, wpipe};
 use std::{mem, path, ptr, sync, time};
 
 mod bitmap;
@@ -40,7 +40,7 @@ pub struct KosaCfg {
 pub struct Kosa {
     file: sync::Arc<ffile::FrozenFile>,
     pipe: wpipe::WritePipe,
-    bmap: sync::RwLock<bitmap::BitMap>,
+    bmap: bitmap::BitMap,
     crc32c: crc32::Crc32C,
     pool: bufpool::BufPool,
     buf_size: usize,
@@ -81,8 +81,8 @@ impl Kosa {
             file,
             pipe,
             pool,
+            bmap,
             bmap_path,
-            bmap: sync::RwLock::new(bmap),
             crc32c: crc32::Crc32C::new(),
             buf_size: cfg.buffer_size as usize,
             flush_duration: cfg.flush_duration,
@@ -91,7 +91,7 @@ impl Kosa {
 
     ///
     #[inline(always)]
-    pub fn write(&self, src: &[u8]) -> error::FrozenResult<(wpipe::WriteRequest, u64)> {
+    pub fn write(&self, src: &[u8]) -> error::FrozenResult<(ack::AckTicket, u64)> {
         const CRC_SIZE: usize = mem::size_of::<u32>();
         const LEN_SIZE: usize = mem::size_of::<u32>();
         const HEADER_SIZE: usize = CRC_SIZE + LEN_SIZE;
@@ -117,30 +117,16 @@ impl Kosa {
             dst[..CRC_SIZE].copy_from_slice(&checksum);
         }
 
-        let mut slot_index_opt = self.read_bmap()?.allocate(required)?;
+        let mut slot_index_opt = self.bmap.allocate(required)?;
         if slot_index_opt.is_none() {
-            let mut bmap_write = self.write_bmap()?;
-            slot_index_opt = bmap_write.allocate(required)?;
-
-            if slot_index_opt.is_none() {
-                let current_pages = bmap_write.total_pages();
-                let added_pages = current_pages;
-
-                *bmap_write = bitmap::BitMap::new_grown(
-                    &self.bmap_path,
-                    current_pages,
-                    self.flush_duration,
-                    added_pages,
-                )?;
-
-                slot_index_opt = bmap_write.allocate(required)?;
-            }
+            panic!("Out of storage");
         }
 
         let slot_index = slot_index_opt.unwrap();
-        let req = wpipe::WriteRequest { allocation, slot_index };
+        let request = wpipe::WriteRequest { allocation, slot_index };
+        let ticket = self.pipe.write(request)?;
 
-        Ok((req, slot_index as u64))
+        Ok((ticket, slot_index as u64))
     }
 
     ///
@@ -182,17 +168,7 @@ impl Kosa {
     ///
     #[inline(always)]
     pub fn delete(&self, slot_index: u64, n: usize) -> error::FrozenResult<()> {
-        self.read_bmap()?.free(slot_index as usize, n)
-    }
-
-    #[inline]
-    fn read_bmap(&self) -> error::FrozenResult<sync::RwLockReadGuard<'_, bitmap::BitMap>> {
-        self.bmap.read().map_err(|poison_err| err::new_error(err::PSN, poison_err))
-    }
-
-    #[inline]
-    fn write_bmap(&self) -> error::FrozenResult<sync::RwLockWriteGuard<'_, bitmap::BitMap>> {
-        self.bmap.write().map_err(|poison_err| err::new_error(err::PSN, poison_err))
+        self.bmap.free(slot_index as usize, n)
     }
 }
 
@@ -238,19 +214,9 @@ mod tests {
             let engine = setup_engine(dir.path());
 
             let payload = b"hello world, fire and forget. Go";
-            let (req, slot_index) = engine.write(payload).unwrap();
+            let (_ticket, slot_index) = engine.write(payload).unwrap();
 
-            assert_eq!(req.allocation.length(), 1);
             assert_eq!(slot_index, 0);
-
-            let buf = req.allocation.first();
-            let src = unsafe { std::slice::from_raw_parts(buf, engine.buf_size) };
-            let stored_crc = u32::from_le_bytes(src[..4].try_into().unwrap());
-
-            let mut expected_crc_engine = crc32::Crc32C::new();
-            let expected_crc = expected_crc_engine.crc(&src[8..]);
-
-            assert_eq!(stored_crc, expected_crc, "CRC checksum mismatch in write buffer");
         }
 
         #[test]
@@ -279,78 +245,51 @@ mod tests {
         use super::*;
 
         #[test]
-        fn ok_trigger_growth() {
-            let dir = tempdir().unwrap();
-            let engine = setup_engine(dir.path());
-
-            let payload = b"growth trigger payload";
-
-            let mut last_slot = 0;
-            for _ in 0..2000 {
-                let (_req, slot) = engine.write(payload).expect("Write failed during growth test");
-                last_slot = slot;
-            }
-
-            // Verify we crossed the page boundary
-            assert!(last_slot >= 1792, "Slot should have crossed the first page boundary");
-
-            // Verify the internal bitmap actually expanded
-            let bmap_pages = engine.read_bmap().unwrap().total_pages();
-            assert!(bmap_pages > 1, "Bitmap did not grow its total pages");
-        }
-
-        #[test]
-        fn stress_concurrent_writes() {
-            use std::collections::HashSet;
-            use std::sync::{Arc, Mutex};
+        fn stress_concurrent_read_write() {
+            use std::sync::Arc;
             use std::thread;
 
             let dir = tempdir().unwrap();
-            // Wrap engine in Arc for cross-thread sharing
             let engine = Arc::new(setup_engine(dir.path()));
 
-            let thread_count = 16;
-            let writes_per_thread = 200; // 16 * 200 = 3200 total writes (forces growth multiple times)
+            let thread_count = 0x0A;
+            let ops_per_thread = 0x64;
 
             let mut handles = vec![];
-            let all_slots = Arc::new(Mutex::new(HashSet::new()));
-
-            for t in 0..thread_count {
+            for t_idx in 0..thread_count {
                 let eng = Arc::clone(&engine);
-                let slots_set = Arc::clone(&all_slots);
 
                 handles.push(thread::spawn(move || {
-                    for i in 0..writes_per_thread {
-                        let payload = format!("thread {} payload {}", t, i);
+                    let header_size = std::mem::size_of::<u32>() * 2;
+                    let payload_capacity = 4096 - header_size;
 
-                        // We expect this to successfully lock, potentially grow, and allocate
-                        let (_req, slot) =
-                            eng.write(payload.as_bytes()).expect("Concurrent write failed");
+                    for op_idx in 0..ops_per_thread {
+                        let payload_str = format!(
+                            "Thread {} - Op {} - Data must survive the concurrent storm.",
+                            t_idx, op_idx
+                        );
+                        let payload = payload_str.as_bytes();
 
-                        // Immediately lock the set and verify we didn't get a duplicate slot
-                        let mut set = slots_set.lock().unwrap();
-                        assert!(
-                            set.insert(slot),
-                            "CRITICAL: Duplicate slot index allocated: {}",
-                            slot
+                        let required = payload.len().div_ceil(payload_capacity).max(1);
+                        let (ticket, slot) = eng.write(payload).expect("Concurrent write failed");
+
+                        ticket.wait().unwrap();
+
+                        let read_result = eng.read(slot, required).expect("Concurrent read failed");
+                        let read_data = read_result.expect("CRC mismatch or data missing");
+
+                        assert_eq!(
+                            payload, read_data,
+                            "Data corruption detected on thread {} op {}",
+                            t_idx, op_idx
                         );
                     }
                 }));
             }
 
             for handle in handles {
-                handle.join().expect("A writer thread panicked");
+                handle.join().expect("A thread panicked during stress testing");
             }
-
-            let final_set = all_slots.lock().unwrap();
-            assert_eq!(
-                final_set.len(),
-                thread_count * writes_per_thread,
-                "Total allocated slots do not match requested writes"
-            );
-
-            let bmap_pages = engine.read_bmap().unwrap().total_pages();
-            assert!(bmap_pages > 1, "Bitmap should have grown under concurrent stress");
         }
     }
 }
