@@ -94,7 +94,7 @@ impl Kosa {
     pub fn write(&self, src: &[u8]) -> error::FrozenResult<(wpipe::WriteRequest, u64)> {
         const CRC_SIZE: usize = mem::size_of::<u32>();
         const LEN_SIZE: usize = mem::size_of::<u32>();
-        const HEADER_SIZE: usize = CRC_SIZE + LEN_SIZE; // 8 bytes aligned!
+        const HEADER_SIZE: usize = CRC_SIZE + LEN_SIZE;
 
         let payload_size = self.buf_size - HEADER_SIZE;
         let required = src.len().div_ceil(payload_size);
@@ -211,7 +211,7 @@ mod err {
 }
 
 #[cfg(test)]
-mod lib_tests {
+mod tests {
     use super::*;
     use tempfile::tempdir;
 
@@ -229,45 +229,128 @@ mod lib_tests {
         Kosa::new(cfg).unwrap()
     }
 
-    #[test]
-    fn ok_write_single_block() {
-        let dir = tempdir().unwrap();
-        let engine = setup_engine(dir.path());
+    mod crud {
+        use super::*;
 
-        let payload = b"hello world, fire and forget. Go";
-        let (req, slot_index) = engine.write(payload).unwrap();
+        #[test]
+        fn ok_write_single_block() {
+            let dir = tempdir().unwrap();
+            let engine = setup_engine(dir.path());
 
-        assert_eq!(req.allocation.length(), 1);
-        assert_eq!(slot_index, 0);
+            let payload = b"hello world, fire and forget. Go";
+            let (req, slot_index) = engine.write(payload).unwrap();
 
-        let buf = req.allocation.first();
-        let src = unsafe { std::slice::from_raw_parts(buf, engine.buf_size) };
-        let stored_crc = u32::from_le_bytes(src[..4].try_into().unwrap());
+            assert_eq!(req.allocation.length(), 1);
+            assert_eq!(slot_index, 0);
 
-        let mut expected_crc_engine = crc32::Crc32C::new();
-        let expected_crc = expected_crc_engine.crc(&src[8..]);
+            let buf = req.allocation.first();
+            let src = unsafe { std::slice::from_raw_parts(buf, engine.buf_size) };
+            let stored_crc = u32::from_le_bytes(src[..4].try_into().unwrap());
 
-        assert_eq!(stored_crc, expected_crc, "CRC checksum mismatch in write buffer");
+            let mut expected_crc_engine = crc32::Crc32C::new();
+            let expected_crc = expected_crc_engine.crc(&src[8..]);
+
+            assert_eq!(stored_crc, expected_crc, "CRC checksum mismatch in write buffer");
+        }
+
+        #[test]
+        fn ok_delete_lifecycle() {
+            let dir = tempdir().unwrap();
+            let engine = setup_engine(dir.path());
+
+            let payload = vec![0x01; 0x100];
+            let (_req1, slot1) = engine.write(&payload).unwrap();
+            assert_eq!(slot1, 0);
+
+            assert!(engine.delete(slot1, 1).is_ok());
+        }
+
+        #[test]
+        fn ok_read_empty_required() {
+            let dir = tempdir().unwrap();
+            let engine = setup_engine(dir.path());
+
+            let result = engine.read(0, 0).unwrap();
+            assert_eq!(result, Some(Vec::new()), "Expected empty vector for 0 required blocks");
+        }
     }
 
-    #[test]
-    fn ok_delete_lifecycle() {
-        let dir = tempdir().unwrap();
-        let engine = setup_engine(dir.path());
+    mod stress {
+        use super::*;
 
-        let payload = vec![0x01; 0x100];
-        let (_req1, slot1) = engine.write(&payload).expect("First write failed");
-        assert_eq!(slot1, 0);
+        #[test]
+        fn ok_trigger_growth() {
+            let dir = tempdir().unwrap();
+            let engine = setup_engine(dir.path());
 
-        assert!(engine.delete(slot1, 1).is_ok());
-    }
+            let payload = b"growth trigger payload";
 
-    #[test]
-    fn ok_read_empty_required() {
-        let dir = tempdir().unwrap();
-        let engine = setup_engine(dir.path());
+            let mut last_slot = 0;
+            for _ in 0..2000 {
+                let (_req, slot) = engine.write(payload).expect("Write failed during growth test");
+                last_slot = slot;
+            }
 
-        let result = engine.read(0, 0).expect("Read failed");
-        assert_eq!(result, Some(Vec::new()), "Expected empty vector for 0 required blocks");
+            // Verify we crossed the page boundary
+            assert!(last_slot >= 1792, "Slot should have crossed the first page boundary");
+
+            // Verify the internal bitmap actually expanded
+            let bmap_pages = engine.read_bmap().unwrap().total_pages();
+            assert!(bmap_pages > 1, "Bitmap did not grow its total pages");
+        }
+
+        #[test]
+        fn stress_concurrent_writes() {
+            use std::collections::HashSet;
+            use std::sync::{Arc, Mutex};
+            use std::thread;
+
+            let dir = tempdir().unwrap();
+            // Wrap engine in Arc for cross-thread sharing
+            let engine = Arc::new(setup_engine(dir.path()));
+
+            let thread_count = 16;
+            let writes_per_thread = 200; // 16 * 200 = 3200 total writes (forces growth multiple times)
+
+            let mut handles = vec![];
+            let all_slots = Arc::new(Mutex::new(HashSet::new()));
+
+            for t in 0..thread_count {
+                let eng = Arc::clone(&engine);
+                let slots_set = Arc::clone(&all_slots);
+
+                handles.push(thread::spawn(move || {
+                    for i in 0..writes_per_thread {
+                        let payload = format!("thread {} payload {}", t, i);
+
+                        // We expect this to successfully lock, potentially grow, and allocate
+                        let (_req, slot) =
+                            eng.write(payload.as_bytes()).expect("Concurrent write failed");
+
+                        // Immediately lock the set and verify we didn't get a duplicate slot
+                        let mut set = slots_set.lock().unwrap();
+                        assert!(
+                            set.insert(slot),
+                            "CRITICAL: Duplicate slot index allocated: {}",
+                            slot
+                        );
+                    }
+                }));
+            }
+
+            for handle in handles {
+                handle.join().expect("A writer thread panicked");
+            }
+
+            let final_set = all_slots.lock().unwrap();
+            assert_eq!(
+                final_set.len(),
+                thread_count * writes_per_thread,
+                "Total allocated slots do not match requested writes"
+            );
+
+            let bmap_pages = engine.read_bmap().unwrap().total_pages();
+            assert!(bmap_pages > 1, "Bitmap should have grown under concurrent stress");
+        }
     }
 }
