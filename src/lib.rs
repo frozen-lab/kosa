@@ -109,4 +109,34 @@ impl Kosa {
 
         Ok((req, slot_index as u64))
     }
+
+    ///
+    #[inline(always)]
+    pub fn read(&self, slot_index: u64, required: usize) -> error::FrozenResult<Option<Vec<u8>>> {
+        const CRC_SIZE: usize = mem::size_of::<u32>();
+
+        if required == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let allocation = self.pool.allocate(required);
+        self.file.pread(allocation.first(), slot_index as usize)?;
+
+        let mut output = Vec::with_capacity(required * (self.buf_size - CRC_SIZE));
+        for buf in allocation.iter() {
+            let src = unsafe { std::slice::from_raw_parts(buf, self.buf_size) };
+            let stored_crc = u32::from_le_bytes(src[..CRC_SIZE].try_into().unwrap());
+
+            let payload = &src[CRC_SIZE..];
+            let computed_crc = self.crc32c.crc(payload);
+
+            if stored_crc != computed_crc {
+                return Ok(None);
+            }
+
+            output.extend_from_slice(payload);
+        }
+
+        Ok(Some(output))
+    }
 }
