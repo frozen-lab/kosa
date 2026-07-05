@@ -1,5 +1,5 @@
 //! Benchmarks for `write` latency
-//! Run using: `taskset -c 2,3,4,5,6 cargo bench --bench write`
+//! Run using: `taskset -c 2,3,4,5 cargo bench --bench write`
 
 use frozen_core::utils::BufferSize;
 use hdrhistogram::Histogram;
