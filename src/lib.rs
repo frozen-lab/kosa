@@ -3,10 +3,9 @@
 #![deny(missing_docs)]
 #![deny(unused_must_use)]
 #![allow(unsafe_op_in_unsafe_fn)]
-#![allow(unused)]
 
 use frozen_core::{ack, bufpool, crc32, error, ffile, utils, wpipe};
-use std::{mem, path, ptr, sync, time};
+use std::{mem, path, sync, time};
 
 mod bitmap;
 
@@ -44,8 +43,6 @@ pub struct Kosa {
     crc32c: crc32::Crc32C,
     pool: bufpool::BufPool,
     buf_size: usize,
-    bmap_path: path::PathBuf,
-    flush_duration: time::Duration,
 }
 
 impl Kosa {
@@ -75,17 +72,15 @@ impl Kosa {
         } else {
             (cfg.initial_available_buffers + bitmap::SLOTS_PER_PAGE - 1) / bitmap::SLOTS_PER_PAGE
         };
-        let bmap = bitmap::BitMap::new(bmap_path.clone(), init_pages, cfg.flush_duration)?;
+        let bmap = bitmap::BitMap::new(bmap_path, init_pages, cfg.flush_duration)?;
 
         Ok(Self {
             file,
             pipe,
             pool,
             bmap,
-            bmap_path,
             crc32c: crc32::Crc32C::new(),
             buf_size: cfg.buffer_size as usize,
-            flush_duration: cfg.flush_duration,
         })
     }
 
@@ -99,7 +94,7 @@ impl Kosa {
         let payload_size = self.buf_size - HEADER_SIZE;
         let required = src.len().div_ceil(payload_size);
 
-        let mut allocation = self.pool.allocate(required);
+        let allocation = self.pool.allocate(required);
         for (idx, buf) in allocation.iter().enumerate() {
             let start = idx * payload_size;
             let end = (start + payload_size).min(src.len());
@@ -117,7 +112,7 @@ impl Kosa {
             dst[..CRC_SIZE].copy_from_slice(&checksum);
         }
 
-        let mut slot_index_opt = self.bmap.allocate(required)?;
+        let slot_index_opt = self.bmap.allocate(required)?;
         if slot_index_opt.is_none() {
             panic!("Out of storage");
         }
@@ -172,20 +167,6 @@ impl Kosa {
     }
 }
 
-mod err {
-    use super::error::{ErrCode, FrozenError};
-
-    /// Domain ID for [`wpipe`] module is `0x02` used while propagating errors
-    const DOMAIN_ID: u8 = 0x14;
-
-    #[inline]
-    pub fn new_error<E: std::fmt::Display>(code: ErrCode, observed_error: E) -> FrozenError {
-        FrozenError::new_raw(super::MODULE_ID, DOMAIN_ID, code, observed_error)
-    }
-
-    pub const PSN: ErrCode = ErrCode::new(0x02, "lock poisoned");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,39 +186,107 @@ mod tests {
         Kosa::new(cfg).unwrap()
     }
 
+    #[test]
+    fn ok_write_single_block() {
+        let dir = tempdir().unwrap();
+        let engine = setup_engine(dir.path());
+
+        let payload = b"hello world, fire and forget. Go";
+        let (_ticket, slot_index) = engine.write(payload).unwrap();
+
+        assert_eq!(slot_index, 0);
+    }
+
+    #[test]
+    fn ok_delete_lifecycle() {
+        let dir = tempdir().unwrap();
+        let engine = setup_engine(dir.path());
+
+        let payload = vec![0x01; 0x100];
+        let (_req1, slot1) = engine.write(&payload).unwrap();
+        assert_eq!(slot1, 0);
+
+        assert!(engine.delete(slot1, 1).is_ok());
+    }
+
+    #[test]
+    fn ok_read_empty_required() {
+        let dir = tempdir().unwrap();
+        let engine = setup_engine(dir.path());
+
+        let result = engine.read(0, 0).unwrap();
+        assert_eq!(result, Some(Vec::new()), "Expected empty vector for 0 required blocks");
+    }
+
     mod crud {
         use super::*;
 
         #[test]
-        fn ok_write_single_block() {
+        fn ok_write_then_read_success() {
             let dir = tempdir().unwrap();
             let engine = setup_engine(dir.path());
 
-            let payload = b"hello world, fire and forget. Go";
-            let (_ticket, slot_index) = engine.write(payload).unwrap();
+            let payload = b"testing complete read/write lifecycle";
+            let (ticket, slot_index) = engine.write(payload).unwrap();
 
-            assert_eq!(slot_index, 0);
+            ticket.wait().unwrap();
+
+            let header_size = std::mem::size_of::<u32>() * 2;
+            let payload_capacity = engine.buf_size - header_size;
+            let required = payload.len().div_ceil(payload_capacity).max(1);
+
+            let read_result = engine.read(slot_index, required).unwrap();
+            let read_data = read_result.unwrap();
+
+            assert_eq!(payload.as_slice(), read_data.as_slice());
         }
 
         #[test]
-        fn ok_delete_lifecycle() {
+        fn ok_write_multiple_blocks() {
             let dir = tempdir().unwrap();
             let engine = setup_engine(dir.path());
 
-            let payload = vec![0x01; 0x100];
-            let (_req1, slot1) = engine.write(&payload).unwrap();
+            let payload = vec![0x42; 5000];
+            let (ticket, slot_index) = engine.write(&payload).unwrap();
+
+            ticket.wait().unwrap();
+
+            let header_size = std::mem::size_of::<u32>() * 2;
+            let payload_capacity = engine.buf_size - header_size;
+            let required = payload.len().div_ceil(payload_capacity).max(1);
+
+            let read_result = engine.read(slot_index, required).unwrap();
+            let read_data = read_result.unwrap();
+
+            assert_eq!(payload, read_data);
+        }
+
+        #[test]
+        fn ok_delete_allows_reuse() {
+            let dir = tempdir().unwrap();
+            let engine = setup_engine(dir.path());
+
+            let payload1 = b"first payload";
+            let (ticket1, slot1) = engine.write(payload1).unwrap();
+
+            ticket1.wait().unwrap();
             assert_eq!(slot1, 0);
 
-            assert!(engine.delete(slot1, 1).is_ok());
-        }
+            engine.delete(slot1, 1).unwrap();
 
-        #[test]
-        fn ok_read_empty_required() {
-            let dir = tempdir().unwrap();
-            let engine = setup_engine(dir.path());
+            let payload2 = b"second payload overwriting";
+            let (ticket2, slot2) = engine.write(payload2).unwrap();
 
-            let result = engine.read(0, 0).unwrap();
-            assert_eq!(result, Some(Vec::new()), "Expected empty vector for 0 required blocks");
+            ticket2.wait().unwrap();
+
+            let header_size = std::mem::size_of::<u32>() * 2;
+            let payload_capacity = engine.buf_size - header_size;
+            let required = payload2.len().div_ceil(payload_capacity).max(1);
+
+            let read_result = engine.read(slot2, required).unwrap();
+            let read_data = read_result.expect("Failed to read valid data");
+
+            assert_eq!(payload2.as_slice(), read_data.as_slice());
         }
     }
 

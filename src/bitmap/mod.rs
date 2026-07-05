@@ -43,33 +43,15 @@ impl BitMap {
         Ok(Self { mmap, simd: simd::SIMD::new(), next_page: atomic::AtomicUsize::new(init_page) })
     }
 
-    pub(crate) fn new_grown<P: AsRef<path::Path>>(
-        path: P,
-        init_pages: usize,
-        flush_duration: time::Duration,
-        new_pages: usize,
-    ) -> error::FrozenResult<Self> {
-        let cfg = fmmap::FrozenMMapCfg {
-            flush_duration,
-            initial_count: init_pages,
-            immediate_durability: false,
-            module_id: crate::MODULE_ID,
-        };
-        let mmap = fmmap::FrozenMMap::<Page>::new_grown(path, cfg, new_pages)?;
-        let init_page = Self::find_init_page_idx(&mmap);
-
-        Ok(Self { mmap, simd: simd::SIMD::new(), next_page: atomic::AtomicUsize::new(init_page) })
-    }
-
     fn find_init_page_idx(mmap: &fmmap::FrozenMMap<Page>) -> usize {
         let mut latest = 0;
         let total = mmap.total_slots();
 
         for i in 0..total {
-            if let Some(idx) = unsafe {
+            if let Some(_) = unsafe {
                 mmap.read(i, |page| {
                     if (*page).meta.full_rows_counter < USABLE_ROWS_PER_PAGE as u64 {
-                        return Some(i);
+                        return Some(());
                     }
 
                     None
@@ -81,11 +63,6 @@ impl BitMap {
         }
 
         latest
-    }
-
-    #[inline(always)]
-    pub(crate) fn total_pages(&self) -> usize {
-        self.mmap.total_slots()
     }
 
     #[inline(always)]
