@@ -136,7 +136,8 @@ impl Kosa {
         }
 
         let allocation = self.pool.allocate(required);
-        self.file.pread(allocation.first(), slot_index as usize)?;
+        let allocs: Vec<*mut u8> = allocation.iter().collect();
+        self.file.preadv(&allocs, slot_index as usize)?;
 
         let mut output = Vec::with_capacity(required * (self.buf_size - HEADER_SIZE));
         for buf in allocation.iter() {
