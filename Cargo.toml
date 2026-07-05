@@ -69,3 +69,7 @@ codegen-units = 1
 debug-assertions = false
 overflow-checks = false
 strip = "none"
+
+[[bench]]
+name = "write"
+harness = false

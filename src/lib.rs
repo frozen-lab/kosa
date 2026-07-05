@@ -246,7 +246,7 @@ mod tests {
             let dir = tempdir().unwrap();
             let engine = setup_engine(dir.path());
 
-            let payload = vec![0x42; 5000];
+            let payload = vec![0x42; 0x4000];
             let (ticket, slot_index) = engine.write(&payload).unwrap();
 
             ticket.wait().unwrap();
@@ -284,7 +284,7 @@ mod tests {
             let required = payload2.len().div_ceil(payload_capacity).max(1);
 
             let read_result = engine.read(slot2, required).unwrap();
-            let read_data = read_result.expect("Failed to read valid data");
+            let read_data = read_result.unwrap();
 
             assert_eq!(payload2.as_slice(), read_data.as_slice());
         }
@@ -295,22 +295,19 @@ mod tests {
 
         #[test]
         fn stress_concurrent_read_write() {
-            use std::sync::Arc;
-            use std::thread;
-
             let dir = tempdir().unwrap();
-            let engine = Arc::new(setup_engine(dir.path()));
+            let engine = sync::Arc::new(setup_engine(dir.path()));
 
             let thread_count = 0x0A;
             let ops_per_thread = 0x64;
 
             let mut handles = vec![];
             for t_idx in 0..thread_count {
-                let eng = Arc::clone(&engine);
+                let eng = sync::Arc::clone(&engine);
 
-                handles.push(thread::spawn(move || {
+                handles.push(std::thread::spawn(move || {
                     let header_size = std::mem::size_of::<u32>() * 2;
-                    let payload_capacity = 4096 - header_size;
+                    let payload_capacity = 0x1000 - header_size;
 
                     for op_idx in 0..ops_per_thread {
                         let payload_str = format!(
@@ -320,12 +317,12 @@ mod tests {
                         let payload = payload_str.as_bytes();
 
                         let required = payload.len().div_ceil(payload_capacity).max(1);
-                        let (ticket, slot) = eng.write(payload).expect("Concurrent write failed");
+                        let (ticket, slot) = eng.write(payload).unwrap();
 
                         ticket.wait().unwrap();
 
-                        let read_result = eng.read(slot, required).expect("Concurrent read failed");
-                        let read_data = read_result.expect("CRC mismatch or data missing");
+                        let read_result = eng.read(slot, required).unwrap();
+                        let read_data = read_result.unwrap();
 
                         assert_eq!(
                             payload, read_data,
@@ -337,7 +334,7 @@ mod tests {
             }
 
             for handle in handles {
-                handle.join().expect("A thread panicked during stress testing");
+                handle.join().unwrap();
             }
         }
     }
