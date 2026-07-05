@@ -139,4 +139,10 @@ impl Kosa {
 
         Ok(Some(output))
     }
+
+    ///
+    #[inline(always)]
+    pub fn delete(&self, slot_index: u64, n: usize) -> error::FrozenResult<()> {
+        self.bmap.free(slot_index as usize, n)
+    }
 }
