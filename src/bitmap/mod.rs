@@ -6,6 +6,8 @@ use std::{mem, path, sync::atomic, time};
 pub(in crate::bitmap) type Row = [Word; 4];
 pub(in crate::bitmap) const FULL_WORD: Word = Word::MAX;
 
+pub(crate) const SLOTS_PER_PAGE: usize = SLOTS_PER_ROW * (TOTALE_ROWS_PER_PAGE - 1);
+
 type Word = u64;
 
 const TOTALE_ROWS_PER_PAGE: usize = 8;
@@ -15,7 +17,6 @@ const SLOTS_PER_ROW: usize = mem::size_of::<Row>() * mem::size_of::<u64>();
 const SLOTS_PER_WORD: usize = mem::size_of::<Word>() * mem::size_of::<u64>();
 
 const WORDS_PER_ROW: usize = mem::size_of::<Row>() / 8;
-const SLOTS_PER_PAGE: usize = SLOTS_PER_ROW * (TOTALE_ROWS_PER_PAGE - 1);
 
 #[derive(Debug)]
 pub(crate) struct BitMap {
