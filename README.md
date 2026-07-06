@@ -1,6 +1,22 @@
+[![Latest Version](https://img.shields.io/crates/v/kosa.svg)](https://crates.io/crates/kosa)
+[![License](https://img.shields.io/github/license/frozen-lab/kosa?logo=open-source-initiative&logoColor=white)](https://github.com/frozen-lab/kosa/blob/master/LICENSE)
+[![Tests](https://github.com/frozen-lab/kosa/actions/workflows/tests.yaml/badge.svg)](https://github.com/frozen-lab/kosa/actions/workflows/tests.yaml)
+
 # Kośa (कोश)
 
 A reliable page-based storage engine with fire-and-forget durability semantics
+
+## Usage
+
+Add following to your `Cargo.toml`,
+
+```toml
+[dependencies]
+kosa = { version = "0.0.1" }
+```
+
+> [!NOTE]
+> Current version of `kosa` requires Rust 1.86 or later.
 
 ## Design
 
