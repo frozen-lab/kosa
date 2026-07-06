@@ -102,26 +102,86 @@ pub use wpipe::WriteRequest;
 /// Module ID used in [`frozen_core::error::FrozenError`]
 pub(crate) const MODULE_ID: u8 = 0x01;
 
+/// All the available configurations for [`Kosa`]
 ///
+/// ## Example
+///
+/// ```
+/// use frozen_core::utils::BufferSize;
+/// use kosa::KosaCfg;
+/// use std::time::Duration;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let cfg = KosaCfg {
+///     path: dir.path().to_path_buf(),
+///     buffer_size: BufferSize::S64,
+///     initial_available_buffers: 0x1000,
+///     flush_duration: Duration::from_millis(2),
+///     max_memory: 0x400 * 0x400 * 0x40, // 64 MB
+/// };
+///
+/// assert!(cfg.max_memory > 0);
+/// assert_eq!(cfg.buffer_size as usize, 0x40);
+/// ```
 #[derive(Debug)]
 pub struct KosaCfg {
-    ///
+    /// The root directory path where database files (`data` and `bmap`) will be stored
     pub path: path::PathBuf,
 
-    ///
+    /// Size (in bytes) of an individual page/buffer unit in the storage file
     pub buffer_size: utils::BufferSize,
 
-    ///
+    /// Number of pre-allocated buffer slots in the internal bitmap tracker
     pub initial_available_buffers: usize,
 
-    ///
+    /// Time interval used by the background `WritePipe` to perform a hard sync to the OS
     pub flush_duration: time::Duration,
 
-    ///
+    /// Maximum allowed memory (in bytes) to be allocated simultaneously by the engine
     pub max_memory: usize,
 }
 
 /// Kośa (कोश) is a reliable page-based storage engine with fire-and-forget durability semantics
+///
+/// ## Design
+///
+/// Kośa (कोश) is designed for ultra-low latency I/O operations by offloading durability to a
+/// background asynchronous write pipeline (`WritePipe`).
+///
+/// ## Example
+///
+/// ```
+/// use frozen_core::utils::BufferSize;
+/// use kosa::{Kosa, KosaCfg};
+/// use std::time::Duration;
+///
+/// let dir = tempfile::tempdir().unwrap();
+///
+/// let cfg = KosaCfg {
+///     path: dir.path().to_path_buf(),
+///     buffer_size: BufferSize::S64,
+///     initial_available_buffers: 0x1000,
+///     flush_duration: Duration::from_millis(2),
+///     max_memory: 0x400 * 0x400 * 0x40, // 64 MB
+/// };
+///
+/// let engine = Kosa::new(cfg).unwrap();
+///
+/// let payload = b"hello world, fire and forget semantics!";
+/// let (ticket, slot_index) = engine.write(payload).unwrap();
+///
+/// ticket.wait().unwrap();
+///
+/// let header_size = std::mem::size_of::<u32>() * 2;
+/// let payload_capacity = 0x40 - header_size;
+/// let required_blocks = payload.len().div_ceil(payload_capacity).max(1);
+///
+/// let read_result = engine.read(slot_index, required_blocks).unwrap();
+/// let data = read_result.unwrap();
+///
+/// assert_eq!(payload.as_slice(), data.as_slice());
+/// engine.delete(slot_index, required_blocks).unwrap();
+/// ```
 #[derive(Debug)]
 pub struct Kosa {
     file: sync::Arc<ffile::FrozenFile>,
@@ -133,7 +193,31 @@ pub struct Kosa {
 }
 
 impl Kosa {
+    /// Creates or initializes a new [`Kosa`] storage engine
     ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::utils::BufferSize;
+    /// use kosa::{Kosa, KosaCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let cfg = KosaCfg {
+    ///     path: dir.path().to_path_buf(),
+    ///     buffer_size: BufferSize::S64,
+    ///     initial_available_buffers: 0x10,
+    ///     flush_duration: Duration::from_millis(0x0A),
+    ///     max_memory: 0x400 * 0x400,
+    /// };
+    ///
+    /// let engine = Kosa::new(cfg).unwrap();
+    ///
+    /// let (ticket, slot_index) = engine.write(b"hello, kosa!").unwrap();
+    /// ticket.wait().unwrap();
+    ///
+    /// assert_eq!(slot_index, 0);
+    /// ```
     pub fn new(cfg: KosaCfg) -> error::FrozenResult<Self> {
         let data_path = cfg.path.join("data");
         let bmap_path = cfg.path.join("bmap");
@@ -171,7 +255,36 @@ impl Kosa {
         })
     }
 
+    /// Asynchronously writes a slice of bytes to the storage engine w/ fire-and-forget semantics
     ///
+    /// ## Panics
+    ///
+    /// Panics if the internal `BitMap` fails to allocate the required sequential slots (i.e., the
+    /// engine has exhausted its `initial_available_buffers` limit and cannot find free space).
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::utils::BufferSize;
+    /// use kosa::{Kosa, KosaCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let engine = Kosa::new(KosaCfg {
+    ///     path: dir.path().to_path_buf(),
+    ///     buffer_size: BufferSize::S64,
+    ///     initial_available_buffers: 0x10,
+    ///     flush_duration: Duration::from_millis(0x0A),
+    ///     max_memory: 0x400 * 0x400,
+    /// })
+    /// .unwrap();
+    ///
+    /// let payload = b"hello, kosa!";
+    /// let (ticket, slot_index) = engine.write(payload).unwrap();
+    ///
+    /// ticket.wait().unwrap();
+    /// assert_eq!(slot_index, 0);
+    /// ```
     #[inline(always)]
     pub fn write(&self, src: &[u8]) -> error::FrozenResult<(ack::AckTicket, u64)> {
         const CRC_SIZE: usize = mem::size_of::<u32>();
@@ -211,7 +324,41 @@ impl Kosa {
         Ok((ticket, slot_index as u64))
     }
 
+    /// Synchronously reads a specified number of blocks from the engine starting at `slot_index`
     ///
+    /// ## Why might it return `None`?
+    ///
+    /// Returning `None` is an expected behavior of the storage engine when a checksum validation
+    /// fails.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::utils::BufferSize;
+    /// use kosa::{Kosa, KosaCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let engine = Kosa::new(KosaCfg {
+    ///     path: dir.path().to_path_buf(),
+    ///     buffer_size: BufferSize::S64,
+    ///     initial_available_buffers: 0x10,
+    ///     flush_duration: Duration::from_millis(0x0A),
+    ///     max_memory: 0x400 * 0x400,
+    /// })
+    /// .unwrap();
+    ///
+    /// let payload = b"hello, kosa!";
+    /// let (ticket, slot_index) = engine.write(payload).unwrap();
+    /// ticket.wait().unwrap();
+    ///
+    /// let header_size = std::mem::size_of::<u32>() * 2;
+    /// let payload_capacity = BufferSize::S64 as usize - header_size;
+    /// let required = payload.len().div_ceil(payload_capacity);
+    ///
+    /// let data = engine.read(slot_index, required).unwrap().unwrap();
+    /// assert_eq!(data, payload);
+    /// ```
     #[inline(always)]
     pub fn read(&self, slot_index: u64, required: usize) -> error::FrozenResult<Option<Vec<u8>>> {
         const CRC_SIZE: usize = mem::size_of::<u32>();
@@ -248,7 +395,35 @@ impl Kosa {
         Ok(Some(output))
     }
 
+    /// Logically deletes records from the storage engine
     ///
+    /// ## Example
+    ///
+    /// ```
+    /// use frozen_core::utils::BufferSize;
+    /// use kosa::{Kosa, KosaCfg};
+    /// use std::time::Duration;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let engine = Kosa::new(KosaCfg {
+    ///     path: dir.path().to_path_buf(),
+    ///     buffer_size: BufferSize::S64,
+    ///     initial_available_buffers: 0x10,
+    ///     flush_duration: Duration::from_millis(0x0A),
+    ///     max_memory: 0x800 * 0x800,
+    /// })
+    /// .unwrap();
+    ///
+    /// let payload = b"temporary record";
+    /// let (ticket, slot_index) = engine.write(payload).unwrap();
+    /// ticket.wait().unwrap();
+    ///
+    /// let header_size = std::mem::size_of::<u32>() * 2;
+    /// let payload_capacity = BufferSize::S64 as usize - header_size;
+    /// let required = payload.len().div_ceil(payload_capacity);
+    ///
+    /// engine.delete(slot_index, required).unwrap();
+    /// ```
     #[inline(always)]
     pub fn delete(&self, slot_index: u64, n: usize) -> error::FrozenResult<()> {
         self.bmap.free(slot_index as usize, n)
