@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn ok_neon_isa() {
         unsafe {
-            validate_impl(|slot| SIMD::is_slot_full_neon(slot));
+            validate_impl(|slot| SIMD::is_row_full_neon(slot));
         }
     }
 
