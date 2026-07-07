@@ -96,8 +96,8 @@ use std::{mem, path, sync, time};
 
 mod bitmap;
 
+pub use ack::AckTicket;
 pub use utils::BufferSize;
-pub use wpipe::WriteRequest;
 
 /// Module ID used in [`frozen_core::error::FrozenError`]
 pub(crate) const MODULE_ID: u8 = 0x01;
