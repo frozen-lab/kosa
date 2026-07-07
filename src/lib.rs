@@ -72,19 +72,15 @@
 //! let engine = Kosa::new(cfg).unwrap();
 //!
 //! let payload = b"hello world, fire and forget semantics!";
-//! let (ticket, slot_index) = engine.write(payload).unwrap();
+//! let (ticket, slot_index, n_bufs) = engine.write(payload).unwrap();
 //!
 //! ticket.wait().unwrap();
 //!
-//! let header_size = std::mem::size_of::<u32>() * 2;
-//! let payload_capacity = 0x40 - header_size;
-//! let required_blocks = payload.len().div_ceil(payload_capacity).max(1);
-//!
-//! let read_result = engine.read(slot_index, required_blocks).unwrap();
+//! let read_result = engine.read(slot_index, n_bufs as usize).unwrap();
 //! let data = read_result.unwrap();
 //!
 //! assert_eq!(payload.as_slice(), data.as_slice());
-//! engine.delete(slot_index, required_blocks).unwrap();
+//! engine.delete(slot_index, n_bufs as usize).unwrap();
 //! ```
 
 #![deny(missing_docs)]
@@ -168,19 +164,15 @@ pub struct KosaCfg {
 /// let engine = Kosa::new(cfg).unwrap();
 ///
 /// let payload = b"hello world, fire and forget semantics!";
-/// let (ticket, slot_index) = engine.write(payload).unwrap();
+/// let (ticket, slot_index, n_bufs) = engine.write(payload).unwrap();
 ///
 /// ticket.wait().unwrap();
 ///
-/// let header_size = std::mem::size_of::<u32>() * 2;
-/// let payload_capacity = 0x40 - header_size;
-/// let required_blocks = payload.len().div_ceil(payload_capacity).max(1);
-///
-/// let read_result = engine.read(slot_index, required_blocks).unwrap();
+/// let read_result = engine.read(slot_index, n_bufs as usize).unwrap();
 /// let data = read_result.unwrap();
 ///
 /// assert_eq!(payload.as_slice(), data.as_slice());
-/// engine.delete(slot_index, required_blocks).unwrap();
+/// engine.delete(slot_index, n_bufs as usize).unwrap();
 /// ```
 #[derive(Debug)]
 pub struct Kosa {
@@ -213,10 +205,11 @@ impl Kosa {
     ///
     /// let engine = Kosa::new(cfg).unwrap();
     ///
-    /// let (ticket, slot_index) = engine.write(b"hello, kosa!").unwrap();
+    /// let (ticket, slot_index, n_bufs) = engine.write(b"hello, kosa!").unwrap();
     /// ticket.wait().unwrap();
     ///
     /// assert_eq!(slot_index, 0);
+    /// assert_eq!(n_bufs, 1);
     /// ```
     pub fn new(cfg: KosaCfg) -> error::FrozenResult<Self> {
         let data_path = cfg.path.join("data");
@@ -280,13 +273,14 @@ impl Kosa {
     /// .unwrap();
     ///
     /// let payload = b"hello, kosa!";
-    /// let (ticket, slot_index) = engine.write(payload).unwrap();
+    /// let (ticket, slot_index, n_bufs) = engine.write(payload).unwrap();
     ///
     /// ticket.wait().unwrap();
     /// assert_eq!(slot_index, 0);
+    /// assert_eq!(n_bufs, 1);
     /// ```
     #[inline(always)]
-    pub fn write(&self, src: &[u8]) -> error::FrozenResult<(ack::AckTicket, u64)> {
+    pub fn write(&self, src: &[u8]) -> error::FrozenResult<(ack::AckTicket, u64, u64)> {
         const CRC_SIZE: usize = mem::size_of::<u32>();
         const LEN_SIZE: usize = mem::size_of::<u32>();
         const HEADER_SIZE: usize = CRC_SIZE + LEN_SIZE;
@@ -321,7 +315,7 @@ impl Kosa {
         let request = wpipe::WriteRequest { allocation, slot_index };
         let ticket = self.pipe.write(request)?;
 
-        Ok((ticket, slot_index as u64))
+        Ok((ticket, slot_index as u64, required as u64))
     }
 
     /// Synchronously reads a specified number of blocks from the engine starting at `slot_index`
@@ -349,14 +343,10 @@ impl Kosa {
     /// .unwrap();
     ///
     /// let payload = b"hello, kosa!";
-    /// let (ticket, slot_index) = engine.write(payload).unwrap();
+    /// let (ticket, slot_index, n_bufs) = engine.write(payload).unwrap();
     /// ticket.wait().unwrap();
     ///
-    /// let header_size = std::mem::size_of::<u32>() * 2;
-    /// let payload_capacity = BufferSize::S64 as usize - header_size;
-    /// let required = payload.len().div_ceil(payload_capacity);
-    ///
-    /// let data = engine.read(slot_index, required).unwrap().unwrap();
+    /// let data = engine.read(slot_index, n_bufs as usize).unwrap().unwrap();
     /// assert_eq!(data, payload);
     /// ```
     #[inline(always)]
@@ -415,14 +405,10 @@ impl Kosa {
     /// .unwrap();
     ///
     /// let payload = b"temporary record";
-    /// let (ticket, slot_index) = engine.write(payload).unwrap();
+    /// let (ticket, slot_index, n_bufs) = engine.write(payload).unwrap();
     /// ticket.wait().unwrap();
     ///
-    /// let header_size = std::mem::size_of::<u32>() * 2;
-    /// let payload_capacity = BufferSize::S64 as usize - header_size;
-    /// let required = payload.len().div_ceil(payload_capacity);
-    ///
-    /// engine.delete(slot_index, required).unwrap();
+    /// engine.delete(slot_index, n_bufs as usize).unwrap();
     /// ```
     #[inline(always)]
     pub fn delete(&self, slot_index: u64, n: usize) -> error::FrozenResult<()> {
@@ -455,7 +441,7 @@ mod tests {
         let engine = setup_engine(dir.path());
 
         let payload = b"hello world, fire and forget. Go";
-        let (_ticket, slot_index) = engine.write(payload).unwrap();
+        let (_ticket, slot_index, _) = engine.write(payload).unwrap();
 
         assert_eq!(slot_index, 0);
     }
@@ -466,7 +452,7 @@ mod tests {
         let engine = setup_engine(dir.path());
 
         let payload = vec![0x01; 0x100];
-        let (_req1, slot1) = engine.write(&payload).unwrap();
+        let (_req1, slot1, _) = engine.write(&payload).unwrap();
         assert_eq!(slot1, 0);
 
         assert!(engine.delete(slot1, 1).is_ok());
@@ -490,7 +476,7 @@ mod tests {
             let engine = setup_engine(dir.path());
 
             let payload = b"testing complete read/write lifecycle";
-            let (ticket, slot_index) = engine.write(payload).unwrap();
+            let (ticket, slot_index, _) = engine.write(payload).unwrap();
 
             ticket.wait().unwrap();
 
@@ -510,7 +496,7 @@ mod tests {
             let engine = setup_engine(dir.path());
 
             let payload = vec![0x42; 0x4000];
-            let (ticket, slot_index) = engine.write(&payload).unwrap();
+            let (ticket, slot_index, _) = engine.write(&payload).unwrap();
 
             ticket.wait().unwrap();
 
@@ -530,7 +516,7 @@ mod tests {
             let engine = setup_engine(dir.path());
 
             let payload1 = b"first payload";
-            let (ticket1, slot1) = engine.write(payload1).unwrap();
+            let (ticket1, slot1, _) = engine.write(payload1).unwrap();
 
             ticket1.wait().unwrap();
             assert_eq!(slot1, 0);
@@ -538,7 +524,7 @@ mod tests {
             engine.delete(slot1, 1).unwrap();
 
             let payload2 = b"second payload overwriting";
-            let (ticket2, slot2) = engine.write(payload2).unwrap();
+            let (ticket2, slot2, _) = engine.write(payload2).unwrap();
 
             ticket2.wait().unwrap();
 
@@ -580,7 +566,7 @@ mod tests {
                         let payload = payload_str.as_bytes();
 
                         let required = payload.len().div_ceil(payload_capacity).max(1);
-                        let (ticket, slot) = eng.write(payload).unwrap();
+                        let (ticket, slot, _) = eng.write(payload).unwrap();
 
                         ticket.wait().unwrap();
 

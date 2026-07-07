@@ -40,7 +40,7 @@ fn populate_engine(engine: &Kosa, ops: usize) -> Vec<u64> {
     let mut last_ticket = None;
 
     for i in 1..=ops {
-        let (ticket, slot) = engine.write(&payload).unwrap();
+        let (ticket, slot, _) = engine.write(&payload).unwrap();
         slots.push(slot);
 
         if i % BATCH_SIZE == 0 {
