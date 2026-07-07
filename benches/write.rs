@@ -44,7 +44,7 @@ fn record_bench(engine: &Kosa, ops: usize) -> BenchResult {
     let mut last_ticket = None;
     for i in 1..=ops {
         let start = time::Instant::now();
-        let (ticket, _slot) = engine.write(&payload).expect("write failed");
+        let (ticket, _slot, _) = engine.write(&payload).expect("write failed");
 
         if i % BATCH_SIZE == 0 {
             ticket.wait().expect("wait failed");
@@ -68,7 +68,7 @@ fn single_tx_write_latency() -> BenchResult {
     // warmup
     let warmup_payload = vec![0x00; PAYLOAD_SIZE];
     for _ in 0..WARMUP_OPS {
-        let (_ticket, _) = engine.write(&warmup_payload).expect("warmup write");
+        let (_ticket, _, _) = engine.write(&warmup_payload).expect("warmup write");
     }
 
     record_bench(&engine, OPS)
