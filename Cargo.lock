@@ -110,9 +110,9 @@ dependencies = [
 
 [[package]]
 name = "frozen-core"
-version = "0.0.31"
+version = "0.0.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f497695b19b67e32e02665e89f4c7a63dda0f94a84ee7d9e20cbdeaf0c8198ae"
+checksum = "bd7d9f2c67f89d1f7b007b9b50e452b5d8d40dc36865fd25ac7a2e1f6930bd84"
 dependencies = [
  "event-listener",
  "futures",
