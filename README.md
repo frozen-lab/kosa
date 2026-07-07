@@ -12,7 +12,7 @@ Add following to your `Cargo.toml`,
 
 ```toml
 [dependencies]
-kosa = { version = "0.0.2" }
+kosa = { version = "0.0.3" }
 ```
 
 > [!NOTE]
