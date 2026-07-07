@@ -1,5 +1,9 @@
 # Changelog
 
+## `0.0.3`
+
+- Improved definition of `Kosa::write` (#3)
+
 ## `0.0.2`
 
 - Upgraded to use latest version of `frozen-core` (fixed #1)
